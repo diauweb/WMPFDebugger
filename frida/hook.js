@@ -53,6 +53,7 @@ const hookOnLoadScene = (a1, sceneOffsets) => {
     // 1000: from issue #83 <-- will crash the process
     // 1007: from issue #80
     // 1008: from issue #53
+    // 1023: from desktop launch
     // 1027: from issue #78
     // 1035: from issue #78
     // 1053: from issue #25
@@ -64,10 +65,11 @@ const hookOnLoadScene = (a1, sceneOffsets) => {
     // 1302: from services
     // 1308: minigame?
     const sceneNumberArray = [
-        1005, 1007, 1008, 1027, 1035, 1053, 1074, 1145, 1178, 1256, 1260, 1302,
+        1005, 1007, 1008, 1023, 1027, 1035, 1053, 1074, 1145, 1178, 1256, 1260, 1302,
         1308,
     ];
     if (!sceneNumberArray.includes(miniappScenePtr.readInt())) {
+        send(`[hook] scene not patched: ${miniappScenePtr.readInt()}`);
         return;
     }
     send("[hook] hook scene condition -> 1101");
