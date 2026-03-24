@@ -138,6 +138,9 @@ const proxy_server = (options: CliOptions, logger: Logger) => {
 
 const frida_server = async (options: CliOptions, logger: Logger) => {
     const localDevice = await frida.getLocalDevice();
+    const entryFile =
+        (require.main && require.main.filename) ||
+        (process.mainModule && process.mainModule.filename);
     const processes = await localDevice.enumerateProcesses({
         scope: frida.Scope.Metadata,
     });
@@ -179,14 +182,9 @@ const frida_server = async (options: CliOptions, logger: Logger) => {
     const session = await localDevice.attach(Number(wmpfPid));
 
     // find hook script
-    const projectRoot = path.join(
-        path.dirname(
-            (require.main && require.main.filename) ||
-                (process.mainModule && process.mainModule.filename) ||
-                process.cwd(),
-        ),
-        "..",
-    );
+    const projectRoot = entryFile
+        ? path.join(path.dirname(entryFile), "..")
+        : path.resolve(__dirname, "..");
     let scriptContent: string | null = null;
     try {
         scriptContent = (
