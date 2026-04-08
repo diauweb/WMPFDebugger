@@ -62,8 +62,4 @@ search result.
 Hit `x`, the only function that references this string
 is the target function.
 
-
 ![ResourceCacheHook.2](./screenshots/adaptation/resource_cache_hook.2.png)
-
-
-

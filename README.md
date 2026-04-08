@@ -62,8 +62,7 @@ To upgrade to the latest WMPF (WeChat version < 4.x), type in `:showcmdwnd` in t
 
 ## Prerequisites
 
-* node.js (requires at least LTS v22)
-    - yarn
+* bun (requires at least v1.3)
 * chromium-based browsers (e.g., Chrome, Edge, etc.)
 
 ## Quick Start
@@ -73,13 +72,13 @@ To upgrade to the latest WMPF (WeChat version < 4.x), type in `:showcmdwnd` in t
 ```bash
 git clone https://github.com/evi0s/WMPFDebugger
 cd WMPFDebugger
-yarn
+bun install
 ```
 
 **Step 2.** Run `src/index.ts` to launch debug server and proxy server, and inject hook script to miniapp runtime.
 
 ```bash
-npx ts-node src/index.ts
+bun run src/index.ts
 ```
 
 > Note: After this step, you need to launch the miniapp BEFORE launching the devtools, otherwise you will probably need to kill the server and redo the steps 2 to 4 again.
@@ -101,5 +100,4 @@ BECAUSE THE PROGRAM IS LICENSED FREE OF CHARGE, THERE IS NO WARRANTY FOR THE PRO
 IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING WILL ANY COPYRIGHT HOLDER, OR ANY OTHER PARTY WHO MAY MODIFY AND/OR REDISTRIBUTE THE PROGRAM AS PERMITTED ABOVE, BE LIABLE TO YOU FOR DAMAGES, INCLUDING ANY GENERAL, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE USE OR INABILITY TO USE THE PROGRAM (INCLUDING BUT NOT LIMITED TO LOSS OF DATA OR DATA BEING RENDERED INACCURATE OR LOSSES SUSTAINED BY YOU OR THIRD PARTIES OR A FAILURE OF THE PROGRAM TO OPERATE WITH ANY OTHER PROGRAMS), EVEN IF SUCH HOLDER OR OTHER PARTY HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
 
 The code in the `src/third-party` is extracted from `wechatdevtools` and fully copyrighted by Tencent Holdings Ltd.
-
 
