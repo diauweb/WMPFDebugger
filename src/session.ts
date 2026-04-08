@@ -1,0 +1,153 @@
+import { randomUUID } from "node:crypto";
+import WebSocket, { RawData } from "ws";
+
+import { CliOptions } from "./cli";
+
+export type PendingCommand = {
+    resolve: (payload: any) => void;
+    reject: (error: Error) => void;
+    timeout: NodeJS.Timeout;
+};
+
+export type PendingSpawnWaiter = {
+    resolve: (session: MiniAppSession) => void;
+    reject: (error: Error) => void;
+};
+
+export type PendingContext = {
+    frameId?: string;
+    resolve: (contextId: number) => void;
+    reject: (error: Error) => void;
+    timeout: NodeJS.Timeout;
+};
+
+export type CloseWaiter = {
+    resolve: () => void;
+    timeout: NodeJS.Timeout;
+};
+
+export type AppServiceBinding = {
+    targetId: string;
+    sessionId: string;
+    frameId: string;
+    contextId: number;
+};
+
+export type PendingSpawn = {
+    appid: string;
+    createdAt: number;
+    timeout: NodeJS.Timeout;
+    waiters: Set<PendingSpawnWaiter>;
+};
+
+export type MiniAppSession = {
+    id: string;
+    title: string;
+    attached: boolean;
+    createdAt: number;
+    updatedAt: number;
+    debugSocket?: WebSocket;
+    devtoolsSocket?: WebSocket;
+    messageCounter: number;
+    internalCommandCounter: number;
+    pendingCommands: Map<number, PendingCommand>;
+    pendingContexts: Map<string, PendingContext>;
+    closeWaiters: Set<CloseWaiter>;
+    appService?: AppServiceBinding;
+};
+
+export type CdpFrameTree = {
+    frame?: {
+        id?: string;
+        url?: string;
+        name?: string;
+    };
+    childFrames?: CdpFrameTree[];
+};
+
+export const INTERNAL_CDP_ID_BASE = 1_000_000_000;
+export const INTERNAL_CDP_TIMEOUT_MS = 5_000;
+export const PENDING_SPAWN_TIMEOUT_MS = 15_000;
+
+export const bufferToHexString = (buffer: Buffer) => {
+    return Array.from(buffer)
+        .map((byte) => byte.toString(16).padStart(2, "0"))
+        .join("");
+};
+
+export const rawDataToBuffer = (message: RawData) => {
+    if (Buffer.isBuffer(message)) {
+        return message;
+    }
+
+    if (Array.isArray(message)) {
+        return Buffer.concat(
+            message.map((chunk) =>
+                Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk),
+            ),
+        );
+    }
+
+    return Buffer.from(message);
+};
+
+export const touchSession = (session: MiniAppSession) => {
+    session.updatedAt = Date.now();
+};
+
+const getSessionId = (appid?: string) => {
+    const normalizedAppId = appid?.trim() ?? "";
+    return normalizedAppId || randomUUID();
+};
+
+export const createSession = (appid?: string): MiniAppSession => ({
+    id: getSessionId(appid),
+    title: appid || "miniapp",
+    attached: false,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    messageCounter: 0,
+    internalCommandCounter: INTERNAL_CDP_ID_BASE,
+    pendingCommands: new Map(),
+    pendingContexts: new Map(),
+    closeWaiters: new Set(),
+});
+
+export const flattenFrameTree = (tree?: CdpFrameTree): CdpFrameTree["frame"][] => {
+    if (!tree || !tree.frame) {
+        return [];
+    }
+
+    return [
+        tree.frame,
+        ...((tree.childFrames || []).flatMap((childTree) =>
+            flattenFrameTree(childTree),
+        )),
+    ];
+};
+
+export const serializeSession = (options: CliOptions, session: MiniAppSession) => ({
+    id: session.id,
+    appid: session.id,
+    attached: session.attached,
+    createdAt: new Date(session.createdAt).toISOString(),
+    targetUrl:
+        session.debugSocket !== undefined
+            ? `ws://127.0.0.1:${options.cdpPort}/devtools/page/${session.id}`
+            : null,
+});
+
+export const buildTarget = (options: CliOptions, session: MiniAppSession) => {
+    const websocketPath = `/devtools/page/${session.id}`;
+    return {
+        id: session.id,
+        title: session.title,
+        description: "",
+        type: "page",
+        url: "",
+        devtoolsFrontendUrl:
+            `/devtools/inspector.html?ws=localhost:${options.cdpPort}` +
+            `${websocketPath}`,
+        webSocketDebuggerUrl: `ws://localhost:${options.cdpPort}${websocketPath}`,
+    };
+};
