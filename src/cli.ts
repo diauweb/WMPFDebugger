@@ -3,8 +3,10 @@ import { parseArgs } from "node:util";
 type CliOptions = {
     debugPort: number;
     cdpPort: number;
+    sqlcipherDbRoot?: string;
     debugMain: boolean;
     debugFrida: boolean;
+    noFrida: boolean;
 };
 
 // default debugging port, do not change
@@ -19,8 +21,11 @@ const print_help = () => {
 Options:
   --debug-port <port>  Remote debug server port (default: ${DEBUG_PORT})
   --cdp-port <port>    CDP proxy server port (default: ${CDP_PORT})
+  --sqlcipher-db-root <path>
+                       Root folder for SQLCipher .db files
   --debug-main         Output main process debug messages
   --debug-frida        Output Frida client messages
+  --no-frida           Start HTTP/CDP server without the Frida watchdog
   -h, --help           Show this help message`);
 };
 
@@ -46,8 +51,10 @@ const parse_cli_options = (): CliOptions => {
         options: {
             "debug-port": { type: "string" },
             "cdp-port": { type: "string" },
+            "sqlcipher-db-root": { type: "string" },
             "debug-main": { type: "boolean" },
             "debug-frida": { type: "boolean" },
+            "no-frida": { type: "boolean" },
             help: { type: "boolean", short: "h" },
         },
         allowPositionals: false,
@@ -61,8 +68,10 @@ const parse_cli_options = (): CliOptions => {
     return {
         debugPort: parse_port("--debug-port", values["debug-port"], DEBUG_PORT),
         cdpPort: parse_port("--cdp-port", values["cdp-port"], CDP_PORT),
+        sqlcipherDbRoot: values["sqlcipher-db-root"],
         debugMain: values["debug-main"] ?? false,
         debugFrida: values["debug-frida"] ?? false,
+        noFrida: values["no-frida"] ?? false,
     };
 };
 

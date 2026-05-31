@@ -8,6 +8,9 @@ const printUsage = () => {
   node scripts/test-api.js list [--base-url <url>]
   node scripts/test-api.js spawn <appid> [--base-url <url>]
   node scripts/test-api.js despawn <appid> [--base-url <url>]
+  node scripts/test-api.js sqlcipher-list [--base-url <url>]
+  node scripts/test-api.js sqlcipher-query <database> <sql> [--base-url <url>] [--params <json>] [--max-rows <n>]
+  node scripts/test-api.js sqlcipher-smoke <database> [--base-url <url>]
   node scripts/test-api.js full-test <appid> [--base-url <url>] [--wait-ms <ms>]
 `);
 };
@@ -22,6 +25,8 @@ const parseArgs = (argv) => {
     const positional = [];
     let baseUrl = DEFAULT_BASE_URL;
     let waitMs = 4000;
+    let params = [];
+    let maxRows = undefined;
 
     for (let i = 1; i < args.length; i += 1) {
         const value = args[i];
@@ -35,10 +40,20 @@ const parseArgs = (argv) => {
             waitMs = Number(args[i] || waitMs);
             continue;
         }
+        if (value === "--params") {
+            i += 1;
+            params = JSON.parse(args[i] || "[]");
+            continue;
+        }
+        if (value === "--max-rows") {
+            i += 1;
+            maxRows = Number(args[i] || "0");
+            continue;
+        }
         positional.push(value);
     }
 
-    return { command, baseUrl, waitMs, positional };
+    return { command, baseUrl, waitMs, params, maxRows, positional };
 };
 
 const request = async (baseUrl, pathname, init) => {
@@ -94,6 +109,58 @@ const despawnMiniapp = async (baseUrl, appid) => {
     });
 };
 
+const listSqlcipherDatabases = async (baseUrl) => {
+    return request(baseUrl, "/api/sqlcipher/databases", {
+        method: "GET",
+    });
+};
+
+const querySqlcipher = async (baseUrl, database, sql, params, maxRows) => {
+    const body = { database, sql, params };
+    if (maxRows !== undefined) {
+        body.maxRows = maxRows;
+    }
+    return request(baseUrl, "/api/sqlcipher/query", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+    });
+};
+
+const smokeSqlcipher = async (baseUrl, database) => {
+    const listResult = await listSqlcipherDatabases(baseUrl);
+    printResult("sqlcipher databases", listResult);
+    if (!listResult.ok) {
+        process.exitCode = 1;
+        return;
+    }
+
+    const countResult = await querySqlcipher(
+        baseUrl,
+        database,
+        "SELECT count(*) FROM sqlite_master",
+        [],
+    );
+    printResult("sqlcipher sqlite_master count", countResult);
+    if (!countResult.ok) {
+        process.exitCode = 1;
+        return;
+    }
+
+    const schemaResult = await querySqlcipher(
+        baseUrl,
+        database,
+        "SELECT name, type FROM sqlite_master ORDER BY name LIMIT 5",
+        [],
+    );
+    printResult("sqlcipher schema sample", schemaResult);
+    if (!schemaResult.ok) {
+        process.exitCode = 1;
+    }
+};
+
 const runFull = async (baseUrl, appid, waitMs) => {
     const statusBefore = await getStatus(baseUrl);
     printResult("wechat status", statusBefore);
@@ -130,7 +197,7 @@ const runFull = async (baseUrl, appid, waitMs) => {
 };
 
 const main = async () => {
-    const { command, baseUrl, waitMs, positional } = parseArgs(process.argv);
+    const { command, baseUrl, waitMs, params, maxRows, positional } = parseArgs(process.argv);
 
     if (command === "help") {
         printUsage();
@@ -166,6 +233,40 @@ const main = async () => {
             return;
         }
         printResult("despawn", await despawnMiniapp(baseUrl, appid));
+        return;
+    }
+
+    if (command === "sqlcipher-list") {
+        printResult(
+            "sqlcipher databases",
+            await listSqlcipherDatabases(baseUrl),
+        );
+        return;
+    }
+
+    if (command === "sqlcipher-query") {
+        const database = positional[0];
+        const sql = positional[1];
+        if (!database || !sql) {
+            printUsage();
+            process.exitCode = 1;
+            return;
+        }
+        printResult(
+            "sqlcipher query",
+            await querySqlcipher(baseUrl, database, sql, params, maxRows),
+        );
+        return;
+    }
+
+    if (command === "sqlcipher-smoke") {
+        const database = positional[0];
+        if (!database) {
+            printUsage();
+            process.exitCode = 1;
+            return;
+        }
+        await smokeSqlcipher(baseUrl, database);
         return;
     }
 

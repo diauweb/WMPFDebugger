@@ -9,11 +9,27 @@ const main = async () => {
     install_process_guards(logger);
     const { debug_server } = require("./debug-server") as typeof import("./debug-server");
     const { proxy_server } = require("./proxy-server") as typeof import("./proxy-server");
-    const { start_frida_server } = require("./frida-server") as typeof import("./frida-server");
     const sessions = new Map<string, MiniAppSession>();
     const pendingSpawns = new Map<string, PendingSpawn>();
     const debugServer = debug_server(options, logger, sessions, pendingSpawns);
-    const fridaServer = start_frida_server(logger);
+    const fridaServer = options.noFrida
+        ? {
+            getStatus: () => ({
+                active: false,
+                phase: "waiting" as const,
+                pid: null,
+                version: null,
+                hookInstalled: false,
+                attachedAt: null,
+                lastHookEventAt: null,
+                lastHookMessage: null,
+                lastError: "frida disabled",
+            }),
+        }
+        : (() => {
+            const { start_frida_server } = require("./frida-server") as typeof import("./frida-server");
+            return start_frida_server(logger);
+        })();
     proxy_server(
         options,
         logger,

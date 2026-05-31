@@ -7,6 +7,11 @@ import { Logger } from "./logger";
 import { report_fatal_error } from "./process-guards";
 import { get_wechat_status, spawn_miniapp } from "./wechat-host";
 import {
+    create_sqlcipher_service,
+    get_sqlcipher_error_message,
+    get_sqlcipher_error_status,
+} from "./sqlcipher";
+import {
     MiniAppSession,
     PendingSpawnWaiter,
     PendingSpawn,
@@ -27,6 +32,10 @@ export const proxy_server = (
 ) => {
     const pageWss = new WebSocketServer({ noServer: true });
     const legacyWss = new WebSocketServer({ noServer: true });
+    const sqlcipherService = create_sqlcipher_service(
+        logger,
+        options.sqlcipherDbRoot,
+    );
     const server = createServer();
     server.on("error", (error) => {
         report_fatal_error(logger, "[server] proxy server error", error);
@@ -211,6 +220,65 @@ export const proxy_server = (
                 logger.error("[api] failed to query WeChat status:", error);
                 sendJson(response, 500, {
                     error: "failed to query WeChat status",
+                });
+            }
+            return;
+        }
+
+        if (
+            request.method === "GET" &&
+            requestUrl.pathname === "/api/sqlcipher/databases"
+        ) {
+            try {
+                sendJson(response, 200, {
+                    databases: sqlcipherService.listDatabases(),
+                });
+            } catch (error) {
+                const statusCode = get_sqlcipher_error_status(error);
+                if (statusCode >= 500) {
+                    logger.error("[api] SQLCipher database list failed:", error);
+                }
+                sendJson(response, statusCode, {
+                    error: get_sqlcipher_error_message(error),
+                });
+            }
+            return;
+        }
+
+        if (
+            request.method === "POST" &&
+            requestUrl.pathname === "/api/sqlcipher/query"
+        ) {
+            let body: Record<string, unknown>;
+            try {
+                body = await readJsonBody(request);
+            } catch (error) {
+                sendJson(response, 400, { error: "invalid JSON body" });
+                return;
+            }
+
+            try {
+                const result = sqlcipherService.query({
+                    database:
+                        typeof body.database === "string" ? body.database : "",
+                    sql: typeof body.sql === "string" ? body.sql : "",
+                    params:
+                        body.params === undefined
+                            ? undefined
+                            : (body.params as any),
+                    maxRows:
+                        body.maxRows === undefined
+                            ? undefined
+                            : (body.maxRows as any),
+                });
+                sendJson(response, 200, result);
+            } catch (error) {
+                const statusCode = get_sqlcipher_error_status(error);
+                if (statusCode >= 500) {
+                    logger.error("[api] SQLCipher query failed:", error);
+                }
+                sendJson(response, statusCode, {
+                    error: get_sqlcipher_error_message(error),
                 });
             }
             return;

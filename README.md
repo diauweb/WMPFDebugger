@@ -89,6 +89,67 @@ bun run src/index.ts
 
 **Step 4.** Open your chromium-based browsers, navigate to `devtools://devtools/bundled/inspector.html?ws=127.0.0.1:62000` and profit. You can change the CDP port `CDP_PORT` (62000 in this example) in `src/index.ts` to any port you like.
 
+## SQLCipher API
+
+The HTTP API can inspect SQLCipher-protected `.db` files from a configured
+folder. The API is read-only and keeps database handles in an internal idle
+cache; callers do not manage connections.
+
+```bash
+export WMPF_SQLCIPHER_DB_ROOT=/path/to/databases
+export WMPF_SQLCIPHER_KEY="<64-hex-key>"
+bun run src/index.ts
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:WMPF_SQLCIPHER_DB_ROOT = "C:\path\to\databases"
+$env:WMPF_SQLCIPHER_KEY = "<64-hex-key>"
+bun run src/index.ts
+```
+
+By default the SQLCipher library is loaded from `native/sqlcipher.dll`. For
+Linux viability testing, override it with `WMPF_SQLCIPHER_LIBRARY`, for example:
+
+```bash
+WMPF_SQLCIPHER_LIBRARY=/usr/lib/libsqlcipher.so \
+WMPF_SQLCIPHER_DB_ROOT=$PWD/test-database \
+WMPF_SQLCIPHER_KEY=$(tr -d '\r\n' < test-database/key.txt) \
+bun run src/index.ts --no-frida
+```
+
+`WMPF_SQLCIPHER_KEY` must be one 64-hex WeChat/WCDB base key. If you prefer not
+to put the key directly in the environment, set `WMPF_SQLCIPHER_KEY_FILE` to a
+file containing that one key instead. The API derives the per-database
+SQLCipher raw key from the first 16 bytes of each database, then opens it with
+SQLCipher v3-compatible settings: page size 4096, 64000 KDF iterations, HMAC
+SHA-1, and PBKDF2-HMAC-SHA1.
+
+Endpoints:
+
+```text
+GET  /api/sqlcipher/databases
+POST /api/sqlcipher/query
+```
+
+Query body:
+
+```json
+{
+  "database": "Applet.db",
+  "sql": "SELECT name, type FROM sqlite_master ORDER BY name LIMIT 5",
+  "params": [],
+  "maxRows": 1000
+}
+```
+
+Local smoke helper:
+
+```bash
+node scripts/test-api.js sqlcipher-smoke Applet.db --base-url http://127.0.0.1:62000
+```
+
 ## Screenshots
 
 ![Console in DevTools](screenshots/console.png)
@@ -102,4 +163,3 @@ BECAUSE THE PROGRAM IS LICENSED FREE OF CHARGE, THERE IS NO WARRANTY FOR THE PRO
 IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING WILL ANY COPYRIGHT HOLDER, OR ANY OTHER PARTY WHO MAY MODIFY AND/OR REDISTRIBUTE THE PROGRAM AS PERMITTED ABOVE, BE LIABLE TO YOU FOR DAMAGES, INCLUDING ANY GENERAL, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE USE OR INABILITY TO USE THE PROGRAM (INCLUDING BUT NOT LIMITED TO LOSS OF DATA OR DATA BEING RENDERED INACCURATE OR LOSSES SUSTAINED BY YOU OR THIRD PARTIES OR A FAILURE OF THE PROGRAM TO OPERATE WITH ANY OTHER PROGRAMS), EVEN IF SUCH HOLDER OR OTHER PARTY HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
 
 The code in the `src/third-party` is extracted from `wechatdevtools` and fully copyrighted by Tencent Holdings Ltd.
-

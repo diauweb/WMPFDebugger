@@ -86,6 +86,59 @@ bun run src/index.ts
 
 **第 4 步** 打开浏览器，访问 `devtools://devtools/bundled/inspector.html?ws=127.0.0.1:62000` 即可。你也可以将 CDP 端口（在例子中为 62000）修改到任意其他端口。相关代码定义在 `src/index.ts` 中
 
+## SQLCipher API
+
+HTTP API 可以只读查看指定目录下的 SQLCipher 加密 `.db` 文件。API 内部会缓存已打开的数据库句柄，调用方不需要管理连接。
+
+```bash
+export WMPF_SQLCIPHER_DB_ROOT=/path/to/databases
+export WMPF_SQLCIPHER_KEY="<64-hex-key>"
+bun run src/index.ts
+```
+
+Windows PowerShell：
+
+```powershell
+$env:WMPF_SQLCIPHER_DB_ROOT = "C:\path\to\databases"
+$env:WMPF_SQLCIPHER_KEY = "<64-hex-key>"
+bun run src/index.ts
+```
+
+默认从 `native/sqlcipher.dll` 加载 SQLCipher。Linux 可用 `WMPF_SQLCIPHER_LIBRARY` 覆盖该路径进行可行性测试：
+
+```bash
+WMPF_SQLCIPHER_LIBRARY=/usr/lib/libsqlcipher.so \
+WMPF_SQLCIPHER_DB_ROOT=$PWD/test-database \
+WMPF_SQLCIPHER_KEY=$(tr -d '\r\n' < test-database/key.txt) \
+bun run src/index.ts --no-frida
+```
+
+`WMPF_SQLCIPHER_KEY` 必须是 64 位十六进制 WeChat/WCDB 基础 key。如果不想把 key 直接放进环境变量，也可以改用 `WMPF_SQLCIPHER_KEY_FILE` 指向只包含该 key 的文件。API 会读取每个数据库文件的前 16 字节作为 salt，派生该数据库实际使用的 SQLCipher raw key，并使用 SQLCipher v3 兼容设置打开：page size 4096、KDF 迭代 64000、HMAC SHA-1、PBKDF2-HMAC-SHA1。
+
+接口：
+
+```text
+GET  /api/sqlcipher/databases
+POST /api/sqlcipher/query
+```
+
+查询请求：
+
+```json
+{
+  "database": "Applet.db",
+  "sql": "SELECT name, type FROM sqlite_master ORDER BY name LIMIT 5",
+  "params": [],
+  "maxRows": 1000
+}
+```
+
+本地 smoke helper：
+
+```bash
+node scripts/test-api.js sqlcipher-smoke Applet.db --base-url http://127.0.0.1:62000
+```
+
 ## 截图
 
 ![Console in DevTools](screenshots/console.png)
@@ -104,4 +157,3 @@ bun run src/index.ts
 
 
 此外，在 `src/third-party` 中，所有代码从微信开发者工具提取，因此腾讯控股有限公司拥有对该代码的所有版权
-
