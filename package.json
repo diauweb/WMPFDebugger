@@ -4,6 +4,11 @@
   "main": "src/index.ts",
   "license": "GPL-2.0-only",
   "author": "evi0s",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "start:watchdog": "node scripts/run-with-restart.js",
+    "typecheck": "tsc --noEmit"
+  },
   "dependencies": {
     "frida": "^17.3.2",
     "protobufjs": "^7.5.4",

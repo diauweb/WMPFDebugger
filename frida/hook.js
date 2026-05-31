@@ -119,8 +119,13 @@ const parseConfig = () => {
 const main = () => {
     const config = parseConfig();
     const mainModule = getMainModule(config.Version);
+    if (!mainModule) {
+        throw new Error("[hook] failed to resolve main module");
+    }
+
     patchOnLoadStart(mainModule.base, config);
     patchCDPFilter(mainModule.base, config);
+    send("[hook] interceptors installed");
 };
 
 main();

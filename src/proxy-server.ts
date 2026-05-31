@@ -2,7 +2,9 @@ import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import WebSocket, { WebSocketServer } from "ws";
 
 import { CliOptions } from "./cli";
+import { FridaServerHandle } from "./frida-server";
 import { Logger } from "./logger";
+import { report_fatal_error } from "./process-guards";
 import { get_wechat_status, spawn_miniapp } from "./wechat-host";
 import {
     MiniAppSession,
@@ -21,10 +23,14 @@ export const proxy_server = (
     sessions: Map<string, MiniAppSession>,
     pendingSpawns: Map<string, PendingSpawn>,
     debugServer: ReturnType<typeof debug_server>,
+    fridaServer: FridaServerHandle,
 ) => {
     const pageWss = new WebSocketServer({ noServer: true });
     const legacyWss = new WebSocketServer({ noServer: true });
     const server = createServer();
+    server.on("error", (error) => {
+        report_fatal_error(logger, "[server] proxy server error", error);
+    });
 
     const sendJson = (
         response: ServerResponse<IncomingMessage>,
@@ -199,6 +205,7 @@ export const proxy_server = (
                 sendJson(response, 200, {
                     alive: status.window === "main",
                     window: status.window,
+                    hook: fridaServer.getStatus(),
                 });
             } catch (error) {
                 logger.error("[api] failed to query WeChat status:", error);

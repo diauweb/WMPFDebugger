@@ -14,7 +14,7 @@ const DEBUG_PORT = 9421;
 const CDP_PORT = 62000;
 
 const print_help = () => {
-    console.log(`Usage: npx ts-node src/index.ts [options]
+    console.log(`Usage: bun run src/index.ts [options]
 
 Options:
   --debug-port <port>  Remote debug server port (default: ${DEBUG_PORT})

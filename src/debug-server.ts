@@ -2,6 +2,7 @@ import WebSocket, { RawData, WebSocketServer } from "ws";
 
 import { CliOptions } from "./cli";
 import { Logger } from "./logger";
+import { report_fatal_error } from "./process-guards";
 import {
     MiniAppSession,
     PendingSpawn,
@@ -54,6 +55,9 @@ export const debug_server = (
 ) => {
     const debugSocketSessions = new Map<WebSocket, MiniAppSession>();
     const wss = new WebSocketServer({ port: options.debugPort });
+    wss.on("error", (error) => {
+        report_fatal_error(logger, "[server] debug server error", error);
+    });
     logger.info(
         `[server] debug server running on ws://localhost:${options.debugPort}`,
     );
