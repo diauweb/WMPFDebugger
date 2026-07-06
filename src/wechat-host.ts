@@ -18,6 +18,7 @@ const CBDATA_OFFSET = 8;
 const LPDATA_OFFSET = 16;
 
 const WM_COPYDATA = 0x004a;
+const WM_CLOSE = 0x0010;
 const MINIAPP_LAUNCH_WPARAM = 0x2c96;
 
 const MAIN_WINDOW_CLASS = "WeChatMainWndForPC";
@@ -36,6 +37,14 @@ const user32 =
               },
               BringWindowToTop: {
                   args: ["ptr"],
+                  returns: "bool",
+              },
+              IsWindow: {
+                  args: ["ptr"],
+                  returns: "bool",
+              },
+              PostMessageW: {
+                  args: ["ptr", "u32", "u64", "ptr"],
                   returns: "bool",
               },
           })
@@ -82,6 +91,25 @@ const getWeChatWindow = (): WeChatWindowHandle => {
         window: "none",
         handle: null,
     };
+};
+
+const close_window = (handle: number) => {
+    ensureWindows();
+
+    const normalizedHandle = Number(handle);
+    if (!normalizedHandle || !user32.symbols.IsWindow(normalizedHandle)) {
+        throw new Error("window handle is unavailable");
+    }
+
+    const posted = user32.symbols.PostMessageW(
+        normalizedHandle,
+        WM_CLOSE,
+        BigInt(0),
+        null,
+    );
+    if (!posted) {
+        throw new Error(`failed to post WM_CLOSE to window ${normalizedHandle}`);
+    }
 };
 
 const encodeMiniAppLaunchPayload = (appid: string) =>
@@ -139,4 +167,10 @@ const get_wechat_status = () => runBridge("status");
 
 const spawn_miniapp = (appid: string) => runBridge("spawn", appid);
 
-export { get_wechat_status, spawn_miniapp, WeChatStatus, WeChatWindow };
+export {
+    close_window,
+    get_wechat_status,
+    spawn_miniapp,
+    WeChatStatus,
+    WeChatWindow,
+};

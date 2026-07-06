@@ -40,8 +40,18 @@ type FridaHookStatus = {
     lastError: string | null;
 };
 
+type MiniAppWindowHandle = {
+    handle: number;
+    createdAt: number;
+};
+
 type FridaServerHandle = {
     getStatus: () => FridaHookStatus;
+    claimMiniAppWindow: (createdAfter: number) => MiniAppWindowHandle | undefined;
+};
+
+type RecordedMiniAppWindow = MiniAppWindowHandle & {
+    claimed: boolean;
 };
 
 const FRIDA_RETRY_INTERVAL_MS = 2_000;
@@ -56,6 +66,30 @@ const formatError = (error: unknown) =>
 
 const formatFridaMessageError = (message: frida.ErrorMessage) =>
     message.stack ?? message.description;
+
+const parseWindowHandle = (value: unknown) => {
+    if (typeof value === "number" && Number.isFinite(value)) {
+        return value;
+    }
+    if (typeof value !== "string") {
+        return undefined;
+    }
+
+    const radix = value.startsWith("0x") ? 16 : 10;
+    const parsed = Number.parseInt(
+        radix === 16 ? value.slice(2) : value,
+        radix,
+    );
+    return Number.isFinite(parsed) ? parsed : undefined;
+};
+
+const isWindowCreatedPayload = (
+    payload: unknown,
+): payload is { source: string; event: string; hwnd: unknown } =>
+    typeof payload === "object" &&
+    payload !== null &&
+    (payload as any).source === "win32-window-recorder" &&
+    (payload as any).event === "created";
 
 const resetAttachmentState = (runtime: FridaRuntimeState) => {
     runtime.pid = undefined;
@@ -181,6 +215,7 @@ const attachFrida = async (
     attachmentId: number,
     isCurrentAttachment: (id: number) => boolean,
     requestReconnect: () => void,
+    recordMiniAppWindow: (handle: number) => void,
 ) => {
     const session = await localDevice.attach(target.pid);
     try {
@@ -207,6 +242,13 @@ const attachFrida = async (
                 runtime.lastHookMessage = message.payload;
                 if (message.payload === FRIDA_READY_MESSAGE) {
                     runtime.hookInstalled = true;
+                }
+            } else if (isWindowCreatedPayload(message.payload)) {
+                const handle = parseWindowHandle(message.payload.hwnd);
+                if (handle !== undefined) {
+                    runtime.lastHookEventAt = Date.now();
+                    runtime.lastHookMessage = `window created: 0x${handle.toString(16)}`;
+                    recordMiniAppWindow(handle);
                 }
             }
             logger.frida_debug("[frida client]", message.payload);
@@ -299,8 +341,37 @@ export const start_frida_server = (logger: Logger): FridaServerHandle => {
         phase: "waiting",
         hookInstalled: false,
     };
+    const recordedMiniAppWindows: RecordedMiniAppWindow[] = [];
     let currentAttachment: FridaAttachment | undefined;
     let activeAttachmentId = 0;
+
+    const recordMiniAppWindow = (handle: number) => {
+        recordedMiniAppWindows.push({
+            handle,
+            createdAt: Date.now(),
+            claimed: false,
+        });
+
+        while (recordedMiniAppWindows.length > 50) {
+            recordedMiniAppWindows.shift();
+        }
+        logger.info(`[frida] recorded miniapp hwnd: 0x${handle.toString(16)}`);
+    };
+
+    const claimMiniAppWindow = (createdAfter: number) => {
+        const recordedWindow = recordedMiniAppWindows.find(
+            (candidate) => !candidate.claimed && candidate.createdAt >= createdAfter,
+        );
+        if (!recordedWindow) {
+            return undefined;
+        }
+
+        recordedWindow.claimed = true;
+        return {
+            handle: recordedWindow.handle,
+            createdAt: recordedWindow.createdAt,
+        };
+    };
 
     void (async () => {
         const projectRoot = getProjectRoot();
@@ -368,6 +439,7 @@ export const start_frida_server = (logger: Logger): FridaServerHandle => {
                         attachmentCounter,
                         isCurrentAttachment,
                         requestReconnect,
+                        recordMiniAppWindow,
                     );
                 }
 
@@ -389,7 +461,8 @@ export const start_frida_server = (logger: Logger): FridaServerHandle => {
 
     return {
         getStatus: () => buildStatusSnapshot(runtime, currentAttachment),
+        claimMiniAppWindow,
     };
 };
 
-export { FridaHookStatus, FridaServerHandle };
+export { FridaHookStatus, FridaServerHandle, MiniAppWindowHandle };

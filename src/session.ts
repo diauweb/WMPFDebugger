@@ -53,6 +53,8 @@ export type MiniAppSession = {
     updatedAt: number;
     debugSocket?: WebSocket;
     devtoolsSocket?: WebSocket;
+    windowHandle?: number;
+    launchStartedAt?: number;
     messageCounter: number;
     internalCommandCounter: number;
     pendingCommands: Map<number, PendingCommand>;
@@ -140,6 +142,10 @@ export const serializeSession = (options: CliOptions, session: MiniAppSession) =
     requestedAppId: session.requestedAppId ?? null,
     state: session.state,
     lastError: session.lastError ?? null,
+    windowHandle:
+        session.windowHandle === undefined
+            ? null
+            : `0x${session.windowHandle.toString(16)}`,
     attached: session.attached,
     createdAt: new Date(session.createdAt).toISOString(),
     targetUrl:

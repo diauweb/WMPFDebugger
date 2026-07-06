@@ -11,7 +11,6 @@ const main = async () => {
     const { proxy_server } = require("./proxy-server") as typeof import("./proxy-server");
     const sessions = new Map<string, MiniAppSession>();
     const pendingSpawns = new Map<string, PendingSpawn>();
-    const debugServer = debug_server(options, logger, sessions, pendingSpawns);
     const fridaServer = options.noFrida
         ? {
             getStatus: () => ({
@@ -25,11 +24,19 @@ const main = async () => {
                 lastHookMessage: null,
                 lastError: "frida disabled",
             }),
+            claimMiniAppWindow: () => undefined,
         }
         : (() => {
             const { start_frida_server } = require("./frida-server") as typeof import("./frida-server");
             return start_frida_server(logger);
         })();
+    const debugServer = debug_server(
+        options,
+        logger,
+        sessions,
+        pendingSpawns,
+        fridaServer,
+    );
     proxy_server(
         options,
         logger,

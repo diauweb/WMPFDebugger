@@ -1,8 +1,10 @@
 import WebSocket, { RawData, WebSocketServer } from "ws";
 
 import { CliOptions } from "./cli";
+import type { FridaServerHandle } from "./frida-server";
 import { Logger } from "./logger";
 import { report_fatal_error } from "./process-guards";
+import { close_window } from "./wechat-host";
 import {
     MiniAppSession,
     AppServiceBinding,
@@ -68,6 +70,7 @@ export const debug_server = (
     logger: Logger,
     sessions: Map<string, MiniAppSession>,
     pendingSpawns: Map<string, PendingSpawn>,
+    fridaServer: Pick<FridaServerHandle, "claimMiniAppWindow">,
 ) => {
     const debugSocketSessions = new Map<WebSocket, MiniAppSession>();
     const foregroundKeepAliveActive = new WeakSet<MiniAppSession>();
@@ -103,6 +106,7 @@ export const debug_server = (
         }
 
         session.requestedAppId = pendingSpawn.appid;
+        session.launchStartedAt = pendingSpawn.createdAt;
         session.title = pendingSpawn.appid;
         logger.info(
             `[miniapp] linked pending spawn ${pendingSpawn.appid} to ${session.id}`,
@@ -237,6 +241,35 @@ export const debug_server = (
         closeWebSocket(debugSocket, 1011, reason, true);
     };
 
+    const rememberMiniAppWindow = (session: MiniAppSession) => {
+        if (session.windowHandle !== undefined) {
+            return session.windowHandle;
+        }
+
+        if (session.launchStartedAt === undefined) {
+            return undefined;
+        }
+
+        try {
+            const miniAppWindow = fridaServer.claimMiniAppWindow(
+                session.launchStartedAt,
+            );
+            if (miniAppWindow !== undefined) {
+                session.windowHandle = miniAppWindow.handle;
+                logger.info(
+                    `[miniapp] remembered window hwnd for ${session.id}: 0x${miniAppWindow.handle.toString(16)}`,
+                );
+            }
+        } catch (error) {
+            logger.error(
+                `[miniapp] failed to remember window hwnd for ${session.id}:`,
+                error,
+            );
+        }
+
+        return session.windowHandle;
+    };
+
     const sendMiniAppCdpMessage = (session: MiniAppSession, message: string) => {
         if (!session.debugSocket || session.debugSocket.readyState !== WebSocket.OPEN) {
             throw new Error("miniapp debug socket unavailable");
@@ -365,17 +398,6 @@ export const debug_server = (
         try {
             await sendForegroundCommand(
                 session,
-                "Target.activateTarget",
-                { targetId: appService.targetId },
-            );
-            await sendForegroundCommand(
-                session,
-                "Page.bringToFront",
-                {},
-                appService.sessionId,
-            );
-            await sendForegroundCommand(
-                session,
                 "Emulation.setFocusEmulationEnabled",
                 { enabled: true },
                 appService.sessionId,
@@ -435,6 +457,25 @@ export const debug_server = (
             });
         });
 
+    const findAppTargetId = async (session: MiniAppSession) => {
+        if (session.appService?.targetId) {
+            return session.appService.targetId;
+        }
+
+        const targetResponse = await sendInternalCommand(
+            session,
+            "Target.getTargets",
+        );
+        const targetInfos = targetResponse.result?.targetInfos || [];
+        const targetInfo = targetInfos.find(
+            (candidate: any) => String(candidate.title || "") === "AppIndex",
+        );
+        if (!targetInfo || typeof targetInfo.targetId !== "string") {
+            throw new Error("unable to find app target");
+        }
+        return targetInfo.targetId;
+    };
+
     const discoverAppContext = async (
         session: MiniAppSession,
         options?: {
@@ -449,23 +490,13 @@ export const debug_server = (
         let contextId = existingBinding?.contextId;
 
         if (options?.forceAttach || !targetId || !appServiceSessionId) {
-            const targetResponse = await sendInternalCommand(
-                session,
-                "Target.getTargets",
-            );
-            const targetInfos = targetResponse.result?.targetInfos || [];
-            const targetInfo = targetInfos.find(
-                (candidate: any) => String(candidate.title || "") === "AppIndex",
-            );
-            if (!targetInfo || typeof targetInfo.targetId !== "string") {
-                throw new Error("unable to find app target");
-            }
+            targetId = await findAppTargetId(session);
 
             const attachResponse = await sendInternalCommand(
                 session,
                 "Target.attachToTarget",
                 {
-                    targetId: targetInfo.targetId,
+                    targetId,
                     flatten: true,
                 },
             );
@@ -473,7 +504,6 @@ export const debug_server = (
             if (typeof appServiceSessionId !== "string") {
                 throw new Error("unable to attach app target");
             }
-            targetId = targetInfo.targetId;
             frameId = undefined;
             contextId = undefined;
         }
@@ -777,15 +807,18 @@ export const debug_server = (
         });
 
     const closeMiniApp = async (session: MiniAppSession) => {
-        if (!session.debugSocket || !session.appService) {
-            throw new Error("miniapp session is not ready for close");
+        if (!session.debugSocket) {
+            throw new Error("miniapp debug socket unavailable for close");
+        }
+
+        const windowHandle = rememberMiniAppWindow(session);
+        if (windowHandle === undefined) {
+            throw new Error("miniapp window handle unavailable for close");
         }
 
         const closePromise = waitForMiniAppClose(session);
         try {
-            await sendInternalCommand(session, "Target.closeTarget", {
-                targetId: session.appService.targetId,
-            });
+            close_window(windowHandle);
         } catch (error) {
             if (!session.debugSocket) {
                 await closePromise.catch(() => undefined);
@@ -803,20 +836,33 @@ export const debug_server = (
         touchSession(session);
         stopForegroundKeepAlive(session);
 
+        if (!session.debugSocket) {
+            detachSession(session, reason);
+            logger.info(
+                `[miniapp] miniapp session detached after debug socket closed: ${session.id}`,
+            );
+            return {
+                closed: false,
+                forced: true,
+            };
+        }
+
         try {
             await closeMiniApp(session);
             return {
+                closed: true,
                 forced: false,
             };
         } catch (error) {
             logger.error(
-                `[miniapp] graceful close failed for ${session.id}; terminating runtime:`,
+                `[miniapp] window close failed for ${session.id}; keeping session attached for retry:`,
                 error,
             );
-            detachSession(session, reason);
-            logger.info(`[miniapp] miniapp runtime terminated: ${session.id}`);
+            session.lastError = `miniapp close failed: ${formatErrorMessage(error)}`;
+            touchSession(session);
             return {
-                forced: true,
+                closed: false,
+                forced: false,
             };
         }
     };
@@ -827,6 +873,7 @@ export const debug_server = (
         session.debugSocket = ws;
         sessions.set(session.id, session);
         debugSocketSessions.set(ws, session);
+        rememberMiniAppWindow(session);
         logger.info(`[miniapp] miniapp client connected: ${session.id}`);
 
         ws.on("message", (message) => {

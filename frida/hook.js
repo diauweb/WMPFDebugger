@@ -125,6 +125,9 @@ const main = () => {
 
     patchOnLoadStart(mainModule.base, config);
     patchCDPFilter(mainModule.base, config);
+    if (typeof patchWin32WindowRecorder === "function") {
+        patchWin32WindowRecorder();
+    }
     if (typeof patchWin32ForegroundState === "function") {
         patchWin32ForegroundState();
     }

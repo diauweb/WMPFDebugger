@@ -425,15 +425,19 @@ export const proxy_server = (
                         error,
                     );
                     const failedSession = findSession(appid);
+                    let closeResult:
+                        | Awaited<ReturnType<typeof debugServer.killMiniApp>>
+                        | undefined;
                     if (failedSession) {
-                        await debugServer.killMiniApp(
+                        closeResult = await debugServer.killMiniApp(
                             failedSession,
                             "miniapp did not become ready for evaluate",
                         );
                     }
                     sendJson(response, 504, {
                         error: "miniapp did not become ready in time",
-                        miniappClosed: failedSession !== undefined,
+                        miniappClosed: closeResult?.closed ?? false,
+                        forcedClose: closeResult?.forced ?? false,
                     });
                     return;
                 }
@@ -456,7 +460,7 @@ export const proxy_server = (
                 );
                 sendJson(response, 500, {
                     error: "failed to evaluate in appContext",
-                    miniappClosed: true,
+                    miniappClosed: closeResult.closed,
                     forcedClose: closeResult.forced,
                 });
             }
@@ -506,7 +510,7 @@ export const proxy_server = (
                 sendJson(response, 200, {
                     miniappId: session.id,
                     attached: session.attached,
-                    miniappClosed: true,
+                    miniappClosed: closeResult.closed,
                     forcedClose: closeResult.forced,
                 });
             } catch (error) {

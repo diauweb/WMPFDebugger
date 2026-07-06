@@ -8,6 +8,48 @@ const findWin32Export = (moduleName, symbolName) => {
     }
 };
 
+const patchWin32WindowRecorder = () => {
+    const createWindowExWPtr = findWin32Export("user32.dll", "CreateWindowExW");
+    const createWindowExAPtr = findWin32Export("user32.dll", "CreateWindowExA");
+
+    if (!createWindowExWPtr && !createWindowExAPtr) {
+        send("[hook] win32 window recorder skipped: CreateWindowEx unavailable");
+        return;
+    }
+
+    const WS_CHILD = 0x40000000;
+
+    const attachCreateWindowHook = (targetPtr, apiName) => {
+        if (!targetPtr) {
+            return;
+        }
+
+        Interceptor.attach(targetPtr, {
+            onEnter(args) {
+                this.parentHwnd = args[8];
+                this.style = args[3].toUInt32();
+            },
+            onLeave(retval) {
+                if (retval.isNull() || (this.style & WS_CHILD) !== 0) {
+                    return;
+                }
+
+                send({
+                    source: "win32-window-recorder",
+                    event: "created",
+                    api: apiName,
+                    hwnd: retval.toString(),
+                    parentHwnd: this.parentHwnd.toString(),
+                });
+            },
+        });
+    };
+
+    attachCreateWindowHook(createWindowExWPtr, "CreateWindowExW");
+    attachCreateWindowHook(createWindowExAPtr, "CreateWindowExA");
+    send("[hook] Win32 window recorder installed");
+};
+
 const patchWin32ForegroundState = () => {
     const getForegroundWindowPtr = findWin32Export("user32.dll", "GetForegroundWindow");
     const getActiveWindowPtr = findWin32Export("user32.dll", "GetActiveWindow");
