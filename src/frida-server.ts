@@ -132,6 +132,7 @@ const resolveWeChatTarget = async (
 
 const loadHookScript = async (projectRoot: string) => {
     let scriptContent: string;
+    let foregroundHookContent: string;
     try {
         scriptContent = await promises.readFile(
             path.join(projectRoot, "frida/hook.js"),
@@ -141,7 +142,16 @@ const loadHookScript = async (projectRoot: string) => {
         throw new Error("[frida] hook script not found");
     }
 
-    return scriptContent;
+    try {
+        foregroundHookContent = await promises.readFile(
+            path.join(projectRoot, "frida/win32-foreground-hook.js"),
+            "utf8",
+        );
+    } catch (error) {
+        throw new Error("[frida] win32 foreground hook script not found");
+    }
+
+    return `${foregroundHookContent}\n${scriptContent}`;
 };
 
 const loadVersionConfig = async (projectRoot: string, wmpfVersion: number) => {

@@ -74,9 +74,19 @@ export const proxy_server = (
             .listDebuggableSessions()
             .sort((left, right) => left.createdAt - right.createdAt);
 
+    const findSession = (sessionId: string) =>
+        sessions.get(sessionId) ??
+        Array.from(sessions.values()).find(
+            (session) => session.requestedAppId === sessionId,
+        );
+
     const getReadySession = (appid: string) => {
-        const session = sessions.get(appid);
-        if (!session?.debugSocket || !session.appService) {
+        const session = findSession(appid);
+        if (
+            session?.state !== "ready" ||
+            !session.debugSocket ||
+            !session.appService
+        ) {
             return undefined;
         }
         return session;
@@ -303,8 +313,12 @@ export const proxy_server = (
                 return;
             }
 
-            const existingSession = sessions.get(appid);
-            if (existingSession) {
+            const existingSession = findSession(appid);
+            if (
+                existingSession?.state === "ready" &&
+                existingSession.debugSocket &&
+                existingSession.appService
+            ) {
                 sendJson(response, 200, {
                     miniappId: existingSession.id,
                     appid,
@@ -313,9 +327,9 @@ export const proxy_server = (
                 return;
             }
 
-            if (pendingSpawns.has(appid)) {
+            if (pendingSpawns.has(appid) || existingSession) {
                 sendJson(response, 202, {
-                    miniappId: appid,
+                    miniappId: existingSession?.id ?? appid,
                     appid,
                     attached: false,
                 });
@@ -371,9 +385,13 @@ export const proxy_server = (
                 return;
             }
 
-            let session = sessions.get(appid);
+            let session = findSession(appid);
 
-            if (!session?.debugSocket) {
+            if (
+                session?.state !== "ready" ||
+                !session.debugSocket ||
+                !session.appService
+            ) {
                 const isAlreadyLaunching = pendingSpawns.has(appid);
 
                 if (!isAlreadyLaunching) {
@@ -406,8 +424,16 @@ export const proxy_server = (
                         `[api] miniapp did not become ready for evaluate (${appid}):`,
                         error,
                     );
+                    const failedSession = findSession(appid);
+                    if (failedSession) {
+                        await debugServer.killMiniApp(
+                            failedSession,
+                            "miniapp did not become ready for evaluate",
+                        );
+                    }
                     sendJson(response, 504, {
                         error: "miniapp did not become ready in time",
+                        miniappClosed: failedSession !== undefined,
                     });
                     return;
                 }
@@ -424,8 +450,14 @@ export const proxy_server = (
                     `[api] appContext evaluate failed (${session.id}):`,
                     error,
                 );
+                const closeResult = await debugServer.killMiniApp(
+                    session,
+                    "appContext evaluate failed",
+                );
                 sendJson(response, 500, {
                     error: "failed to evaluate in appContext",
+                    miniappClosed: true,
+                    forcedClose: closeResult.forced,
                 });
             }
             return;
@@ -441,30 +473,41 @@ export const proxy_server = (
                 return;
             }
 
-            if (pendingSpawns.has(sessionId)) {
-                sendJson(response, 409, {
-                    error: "miniapp is still launching",
-                });
-                return;
-            }
-
-            const session = sessions.get(sessionId);
+            const session = findSession(sessionId);
             if (!session) {
+                if (pendingSpawns.has(sessionId)) {
+                    rejectPendingSpawn(
+                        sessionId,
+                        new Error("miniapp despawn requested while launching"),
+                    );
+                    sendJson(response, 202, {
+                        miniappId: sessionId,
+                        attached: false,
+                        miniappClosed: false,
+                    });
+                    return;
+                }
                 sendJson(response, 404, { error: "miniapp not found" });
                 return;
             }
-            if (!session.debugSocket || !session.appService) {
-                sendJson(response, 409, {
-                    error: "miniapp is not ready to despawn",
-                });
-                return;
+
+            if (session.requestedAppId) {
+                rejectPendingSpawn(
+                    session.requestedAppId,
+                    new Error("miniapp despawn requested"),
+                );
             }
 
             try {
-                await debugServer.closeMiniApp(session);
+                const closeResult = await debugServer.killMiniApp(
+                    session,
+                    "miniapp despawn requested",
+                );
                 sendJson(response, 200, {
                     miniappId: session.id,
                     attached: session.attached,
+                    miniappClosed: true,
+                    forcedClose: closeResult.forced,
                 });
             } catch (error) {
                 logger.error(
@@ -490,7 +533,11 @@ export const proxy_server = (
         if (requestUrl.pathname.startsWith("/devtools/page/")) {
             const sessionId = requestUrl.pathname.split("/").pop();
             const session = sessionId ? sessions.get(sessionId) : undefined;
-            if (!session || !session.debugSocket) {
+            if (
+                !session ||
+                session.state !== "ready" ||
+                !session.debugSocket
+            ) {
                 socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
                 socket.destroy();
                 return;

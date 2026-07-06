@@ -33,6 +33,8 @@ export type AppServiceBinding = {
     contextId: number;
 };
 
+export type MiniAppSessionState = "bootstrapping" | "ready" | "closing";
+
 export type PendingSpawn = {
     appid: string;
     createdAt: number;
@@ -43,6 +45,9 @@ export type PendingSpawn = {
 export type MiniAppSession = {
     id: string;
     title: string;
+    requestedAppId?: string;
+    state: MiniAppSessionState;
+    lastError?: string;
     attached: boolean;
     createdAt: number;
     updatedAt: number;
@@ -53,6 +58,7 @@ export type MiniAppSession = {
     pendingCommands: Map<number, PendingCommand>;
     pendingContexts: Map<string, PendingContext>;
     closeWaiters: Set<CloseWaiter>;
+    foregroundKeepAlive?: NodeJS.Timeout;
     appService?: AppServiceBinding;
 };
 
@@ -103,6 +109,8 @@ const getSessionId = (appid?: string) => {
 export const createSession = (appid?: string): MiniAppSession => ({
     id: getSessionId(appid),
     title: appid || "miniapp",
+    requestedAppId: appid,
+    state: "bootstrapping",
     attached: false,
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -129,10 +137,15 @@ export const flattenFrameTree = (tree?: CdpFrameTree): CdpFrameTree["frame"][] =
 export const serializeSession = (options: CliOptions, session: MiniAppSession) => ({
     id: session.id,
     appid: session.id,
+    requestedAppId: session.requestedAppId ?? null,
+    state: session.state,
+    lastError: session.lastError ?? null,
     attached: session.attached,
     createdAt: new Date(session.createdAt).toISOString(),
     targetUrl:
-        session.debugSocket !== undefined
+        session.state === "ready" &&
+        session.debugSocket !== undefined &&
+        session.appService !== undefined
             ? `ws://127.0.0.1:${options.cdpPort}/devtools/page/${session.id}`
             : null,
 });

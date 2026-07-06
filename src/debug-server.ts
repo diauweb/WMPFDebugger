@@ -5,6 +5,7 @@ import { Logger } from "./logger";
 import { report_fatal_error } from "./process-guards";
 import {
     MiniAppSession,
+    AppServiceBinding,
     PendingSpawn,
     CdpFrameTree,
     CloseWaiter,
@@ -18,6 +19,7 @@ import {
 
 const codex = require("./third-party/RemoteDebugCodex.js");
 const messageProto = require("./third-party/WARemoteDebugProtobuf.js");
+const FOREGROUND_KEEP_ALIVE_MS = 3_000;
 
 const ACCOUNT_INFO_EXPRESSION = `
 (() => {
@@ -47,6 +49,20 @@ const isRecoverableAppContextError = (error: unknown) => {
     );
 };
 
+const formatErrorMessage = (error: unknown) =>
+    error instanceof Error ? error.message : String(error ?? "");
+
+const shouldDisableForegroundCommand = (error: unknown) => {
+    const message = formatErrorMessage(error);
+    return (
+        message.includes("wasn't found") ||
+        message.includes("was not found") ||
+        message.includes("Unknown method") ||
+        message.includes("Method not found") ||
+        message.includes("not supported")
+    );
+};
+
 export const debug_server = (
     options: CliOptions,
     logger: Logger,
@@ -54,6 +70,8 @@ export const debug_server = (
     pendingSpawns: Map<string, PendingSpawn>,
 ) => {
     const debugSocketSessions = new Map<WebSocket, MiniAppSession>();
+    const foregroundKeepAliveActive = new WeakSet<MiniAppSession>();
+    const disabledForegroundCommands = new WeakMap<MiniAppSession, Set<string>>();
     const wss = new WebSocketServer({ port: options.debugPort });
     wss.on("error", (error) => {
         report_fatal_error(logger, "[server] debug server error", error);
@@ -65,8 +83,31 @@ export const debug_server = (
 
     const listDebuggableSessions = () =>
         Array.from(sessions.values()).filter(
-            (session) => session.debugSocket !== undefined,
+            (session) =>
+                session.state === "ready" &&
+                session.debugSocket !== undefined &&
+                session.appService !== undefined,
         );
+
+    const findPendingSpawnHint = () => {
+        const pendingSpawnList = Array.from(pendingSpawns.values()).sort(
+            (left, right) => left.createdAt - right.createdAt,
+        );
+        return pendingSpawnList.length === 1 ? pendingSpawnList[0] : undefined;
+    };
+
+    const applyPendingSpawnHint = (session: MiniAppSession) => {
+        const pendingSpawn = findPendingSpawnHint();
+        if (!pendingSpawn) {
+            return;
+        }
+
+        session.requestedAppId = pendingSpawn.appid;
+        session.title = pendingSpawn.appid;
+        logger.info(
+            `[miniapp] linked pending spawn ${pendingSpawn.appid} to ${session.id}`,
+        );
+    };
 
     const resolvePendingSpawn = (appid: string, session: MiniAppSession) => {
         const pendingSpawn = pendingSpawns.get(appid);
@@ -82,10 +123,34 @@ export const debug_server = (
         pendingSpawn.waiters.clear();
     };
 
+    const rejectPendingSpawn = (appid: string, error: Error) => {
+        const pendingSpawn = pendingSpawns.get(appid);
+        if (!pendingSpawn) {
+            return;
+        }
+
+        clearTimeout(pendingSpawn.timeout);
+        pendingSpawns.delete(appid);
+        for (const waiter of pendingSpawn.waiters) {
+            waiter.reject(error);
+        }
+        pendingSpawn.waiters.clear();
+    };
+
+    const rejectSessionPendingSpawn = (
+        session: MiniAppSession,
+        error: Error,
+    ) => {
+        if (session.requestedAppId) {
+            rejectPendingSpawn(session.requestedAppId, error);
+        }
+    };
+
     const removeSession = (session: MiniAppSession) => {
-        const currentSession = sessions.get(session.id);
-        if (currentSession === session) {
-            sessions.delete(session.id);
+        for (const [id, currentSession] of sessions.entries()) {
+            if (currentSession === session) {
+                sessions.delete(id);
+            }
         }
     };
 
@@ -109,6 +174,67 @@ export const debug_server = (
             waiter.resolve();
         }
         session.closeWaiters.clear();
+    };
+
+    const stopForegroundKeepAlive = (session: MiniAppSession) => {
+        if (session.foregroundKeepAlive) {
+            clearInterval(session.foregroundKeepAlive);
+            session.foregroundKeepAlive = undefined;
+        }
+    };
+
+    const closeWebSocket = (
+        socket: WebSocket | undefined,
+        code: number,
+        reason: string,
+        force = false,
+    ) => {
+        if (!socket || socket.readyState === WebSocket.CLOSED) {
+            return;
+        }
+
+        if (force || socket.readyState === WebSocket.CONNECTING) {
+            socket.terminate();
+            return;
+        }
+
+        try {
+            socket.close(code, reason.slice(0, 120));
+            const timeout = setTimeout(() => {
+                if (socket.readyState !== WebSocket.CLOSED) {
+                    socket.terminate();
+                }
+            }, 500);
+            timeout.unref();
+            socket.once("close", () => clearTimeout(timeout));
+        } catch (error) {
+            socket.terminate();
+        }
+    };
+
+    const detachSession = (session: MiniAppSession, reason: string) => {
+        const debugSocket = session.debugSocket;
+        const devtoolsSocket = session.devtoolsSocket;
+
+        session.debugSocket = undefined;
+        session.devtoolsSocket = undefined;
+        session.appService = undefined;
+        session.attached = false;
+        session.state = "closing";
+        session.lastError = reason;
+        touchSession(session);
+
+        stopForegroundKeepAlive(session);
+        rejectPendingWork(session, reason);
+        resolveCloseWaiters(session);
+        removeSession(session);
+
+        if (debugSocket) {
+            debugSocketSessions.delete(debugSocket);
+        }
+
+        closeWebSocket(devtoolsSocket, 1001, reason);
+        closeWebSocket(debugSocket, 1011, reason, true);
     };
 
     const sendMiniAppCdpMessage = (session: MiniAppSession, message: string) => {
@@ -183,6 +309,112 @@ export const debug_server = (
         }
 
         return response;
+    };
+
+    const getDisabledForegroundCommands = (session: MiniAppSession) => {
+        let disabledCommands = disabledForegroundCommands.get(session);
+        if (!disabledCommands) {
+            disabledCommands = new Set<string>();
+            disabledForegroundCommands.set(session, disabledCommands);
+        }
+        return disabledCommands;
+    };
+
+    const sendForegroundCommand = async (
+        session: MiniAppSession,
+        method: string,
+        params?: Record<string, unknown>,
+        sessionId?: string,
+    ) => {
+        const commandKey = sessionId ? `${sessionId}:${method}` : method;
+        const disabledCommands = getDisabledForegroundCommands(session);
+        if (disabledCommands.has(commandKey)) {
+            return;
+        }
+
+        try {
+            await sendInternalCommand(session, method, params, sessionId);
+        } catch (error) {
+            logger.main_debug(
+                `[miniapp] foreground command failed (${session.id}, ${method}):`,
+                error,
+            );
+            if (shouldDisableForegroundCommand(error)) {
+                disabledCommands.add(commandKey);
+            }
+        }
+    };
+
+    const applyForegroundState = async (
+        session: MiniAppSession,
+        appService: AppServiceBinding,
+    ) => {
+        if (
+            session.state === "closing" ||
+            !session.debugSocket ||
+            session.debugSocket.readyState !== WebSocket.OPEN
+        ) {
+            return;
+        }
+
+        if (foregroundKeepAliveActive.has(session)) {
+            return;
+        }
+
+        foregroundKeepAliveActive.add(session);
+        try {
+            await sendForegroundCommand(
+                session,
+                "Target.activateTarget",
+                { targetId: appService.targetId },
+            );
+            await sendForegroundCommand(
+                session,
+                "Page.bringToFront",
+                {},
+                appService.sessionId,
+            );
+            await sendForegroundCommand(
+                session,
+                "Emulation.setFocusEmulationEnabled",
+                { enabled: true },
+                appService.sessionId,
+            );
+            await sendForegroundCommand(
+                session,
+                "Emulation.setIdleOverride",
+                {
+                    isUserActive: true,
+                    isScreenUnlocked: true,
+                },
+                appService.sessionId,
+            );
+            await sendForegroundCommand(
+                session,
+                "Page.setWebLifecycleState",
+                { state: "active" },
+                appService.sessionId,
+            );
+            touchSession(session);
+        } finally {
+            foregroundKeepAliveActive.delete(session);
+        }
+    };
+
+    const startForegroundKeepAlive = (session: MiniAppSession) => {
+        if (session.foregroundKeepAlive) {
+            return;
+        }
+
+        session.foregroundKeepAlive = setInterval(() => {
+            const appService = session.appService;
+            if (!appService) {
+                return;
+            }
+
+            void applyForegroundState(session, appService);
+        }, FOREGROUND_KEEP_ALIVE_MS);
+        session.foregroundKeepAlive.unref();
     };
 
     const waitForExecutionContext = (
@@ -298,6 +530,7 @@ export const debug_server = (
             frameId,
             contextId,
         };
+        await applyForegroundState(session, session.appService);
         touchSession(session);
         return session.appService;
     };
@@ -325,8 +558,15 @@ export const debug_server = (
         const accountInfoValue = accountInfoResponse.result?.result?.value;
         const appId = accountInfoValue?.miniProgram?.appId;
         const appidValue =
-            typeof appId === "string" && appId.length > 0 ? appId : "";
-        session.title = appidValue || session.title;
+            typeof appId === "string" && appId.trim().length > 0
+                ? appId.trim()
+                : "";
+        if (!appidValue) {
+            throw new Error(
+                "miniapp did not return a valid appid; runtime is not running correctly",
+            );
+        }
+        session.title = appidValue;
         touchSession(session);
         return appidValue;
     };
@@ -405,14 +645,25 @@ export const debug_server = (
             const appid = await resolveSessionAppId(session);
             if (appid) {
                 session.title = appid;
+                session.requestedAppId = appid;
                 rekeySessionByAppId(session, appid);
+            }
+            session.state = "ready";
+            session.lastError = undefined;
+            startForegroundKeepAlive(session);
+            touchSession(session);
+            if (appid) {
                 resolvePendingSpawn(appid, session);
             }
-            touchSession(session);
             logger.info(`[miniapp] miniapp ready: ${session.id}`);
         } catch (error) {
+            const errorMessage = formatErrorMessage(error);
+            const closeMessage = `miniapp bootstrap failed: ${errorMessage}`;
+            session.lastError = closeMessage;
             touchSession(session);
             logger.error(`[miniapp] bootstrap failed for ${session.id}:`, error);
+            rejectSessionPendingSpawn(session, new Error(closeMessage));
+            await killMiniApp(session, closeMessage);
         }
     };
 
@@ -530,15 +781,51 @@ export const debug_server = (
             throw new Error("miniapp session is not ready for close");
         }
 
-        await sendInternalCommand(session, "Target.closeTarget", {
-            targetId: session.appService.targetId,
-        });
-        await waitForMiniAppClose(session);
+        const closePromise = waitForMiniAppClose(session);
+        try {
+            await sendInternalCommand(session, "Target.closeTarget", {
+                targetId: session.appService.targetId,
+            });
+        } catch (error) {
+            if (!session.debugSocket) {
+                await closePromise.catch(() => undefined);
+                return;
+            }
+            closePromise.catch(() => undefined);
+            throw error;
+        }
+        await closePromise;
+    };
+
+    const killMiniApp = async (session: MiniAppSession, reason: string) => {
+        session.state = "closing";
+        session.lastError = reason;
+        touchSession(session);
+        stopForegroundKeepAlive(session);
+
+        try {
+            await closeMiniApp(session);
+            return {
+                forced: false,
+            };
+        } catch (error) {
+            logger.error(
+                `[miniapp] graceful close failed for ${session.id}; terminating runtime:`,
+                error,
+            );
+            detachSession(session, reason);
+            logger.info(`[miniapp] miniapp runtime terminated: ${session.id}`);
+            return {
+                forced: true,
+            };
+        }
     };
 
     wss.on("connection", (ws: WebSocket) => {
         const session = createSession();
+        applyPendingSpawnHint(session);
         session.debugSocket = ws;
+        sessions.set(session.id, session);
         debugSocketSessions.set(ws, session);
         logger.info(`[miniapp] miniapp client connected: ${session.id}`);
 
@@ -568,14 +855,18 @@ export const debug_server = (
             currentSession.debugSocket = undefined;
             currentSession.appService = undefined;
             currentSession.attached = false;
+            currentSession.state = "closing";
             touchSession(currentSession);
-            rejectPendingWork(currentSession, "miniapp disconnected");
+            stopForegroundKeepAlive(currentSession);
+            const disconnectError = new Error("miniapp disconnected");
+            rejectSessionPendingSpawn(currentSession, disconnectError);
+            rejectPendingWork(currentSession, disconnectError.message);
             resolveCloseWaiters(currentSession);
             if (
                 currentSession.devtoolsSocket &&
                 currentSession.devtoolsSocket.readyState === WebSocket.OPEN
             ) {
-                    currentSession.devtoolsSocket.close();
+                currentSession.devtoolsSocket.close();
             }
             removeSession(currentSession);
             debugSocketSessions.delete(ws);
@@ -590,6 +881,7 @@ export const debug_server = (
     return {
         listDebuggableSessions,
         closeMiniApp,
+        killMiniApp,
         evaluateInAppContext,
         sendMiniAppCdpMessage,
     };
