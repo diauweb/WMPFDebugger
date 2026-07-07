@@ -45,9 +45,17 @@ type MiniAppWindowHandle = {
     createdAt: number;
 };
 
+type MiniAppWindowClaimOptions = {
+    createdAfter?: number;
+    graceMs?: number;
+    fallbackToLatest?: boolean;
+};
+
 type FridaServerHandle = {
     getStatus: () => FridaHookStatus;
-    claimMiniAppWindow: (createdAfter: number) => MiniAppWindowHandle | undefined;
+    claimMiniAppWindow: (
+        options?: MiniAppWindowClaimOptions,
+    ) => MiniAppWindowHandle | undefined;
 };
 
 type RecordedMiniAppWindow = MiniAppWindowHandle & {
@@ -346,6 +354,14 @@ export const start_frida_server = (logger: Logger): FridaServerHandle => {
     let activeAttachmentId = 0;
 
     const recordMiniAppWindow = (handle: number) => {
+        const existingWindow = recordedMiniAppWindows.find(
+            (candidate) => !candidate.claimed && candidate.handle === handle,
+        );
+        if (existingWindow) {
+            existingWindow.createdAt = Date.now();
+            return;
+        }
+
         recordedMiniAppWindows.push({
             handle,
             createdAt: Date.now(),
@@ -358,10 +374,27 @@ export const start_frida_server = (logger: Logger): FridaServerHandle => {
         logger.info(`[frida] recorded miniapp hwnd: 0x${handle.toString(16)}`);
     };
 
-    const claimMiniAppWindow = (createdAfter: number) => {
-        const recordedWindow = recordedMiniAppWindows.find(
-            (candidate) => !candidate.claimed && candidate.createdAt >= createdAfter,
-        );
+    const claimMiniAppWindow = (options: MiniAppWindowClaimOptions = {}) => {
+        const createdAfter =
+            options.createdAfter === undefined
+                ? undefined
+                : options.createdAfter - (options.graceMs ?? 0);
+        let recordedWindow =
+            createdAfter === undefined
+                ? undefined
+                : recordedMiniAppWindows.find(
+                      (candidate) =>
+                          !candidate.claimed &&
+                          candidate.createdAt >= createdAfter,
+                  );
+
+        if (!recordedWindow && options.fallbackToLatest) {
+            recordedWindow = recordedMiniAppWindows
+                .slice()
+                .reverse()
+                .find((candidate) => !candidate.claimed);
+        }
+
         if (!recordedWindow) {
             return undefined;
         }

@@ -22,6 +22,9 @@ import {
 const codex = require("./third-party/RemoteDebugCodex.js");
 const messageProto = require("./third-party/WARemoteDebugProtobuf.js");
 const FOREGROUND_KEEP_ALIVE_MS = 3_000;
+const MINIAPP_WINDOW_CLAIM_GRACE_MS = 1_000;
+const MINIAPP_WINDOW_WAIT_MS = 2_000;
+const MINIAPP_WINDOW_WAIT_INTERVAL_MS = 100;
 
 const ACCOUNT_INFO_EXPRESSION = `
 (() => {
@@ -241,19 +244,21 @@ export const debug_server = (
         closeWebSocket(debugSocket, 1011, reason, true);
     };
 
-    const rememberMiniAppWindow = (session: MiniAppSession) => {
+    const rememberMiniAppWindow = (
+        session: MiniAppSession,
+        options?: { fallbackToLatest?: boolean },
+    ) => {
         if (session.windowHandle !== undefined) {
             return session.windowHandle;
         }
 
-        if (session.launchStartedAt === undefined) {
-            return undefined;
-        }
-
         try {
-            const miniAppWindow = fridaServer.claimMiniAppWindow(
-                session.launchStartedAt,
-            );
+            const claimBaseline = session.launchStartedAt ?? session.createdAt;
+            const miniAppWindow = fridaServer.claimMiniAppWindow({
+                createdAfter: claimBaseline,
+                graceMs: MINIAPP_WINDOW_CLAIM_GRACE_MS,
+                fallbackToLatest: options?.fallbackToLatest ?? false,
+            });
             if (miniAppWindow !== undefined) {
                 session.windowHandle = miniAppWindow.handle;
                 logger.info(
@@ -268,6 +273,28 @@ export const debug_server = (
         }
 
         return session.windowHandle;
+    };
+
+    const sleep = (ms: number) =>
+        new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+    const waitForMiniAppWindow = async (session: MiniAppSession) => {
+        const deadline = Date.now() + MINIAPP_WINDOW_WAIT_MS;
+        while (Date.now() < deadline) {
+            const windowHandle = rememberMiniAppWindow(session);
+            if (windowHandle !== undefined) {
+                return windowHandle;
+            }
+            if (
+                !session.debugSocket ||
+                session.debugSocket.readyState !== WebSocket.OPEN
+            ) {
+                return undefined;
+            }
+            await sleep(MINIAPP_WINDOW_WAIT_INTERVAL_MS);
+        }
+
+        return rememberMiniAppWindow(session, { fallbackToLatest: true });
     };
 
     const sendMiniAppCdpMessage = (session: MiniAppSession, message: string) => {
@@ -554,15 +581,19 @@ export const debug_server = (
             contextId = await contextPromise;
         }
 
-        session.appService = {
+        const appService = {
             targetId,
             sessionId: appServiceSessionId,
             frameId,
             contextId,
         };
-        await applyForegroundState(session, session.appService);
+        session.appService = appService;
+        await applyForegroundState(session, appService);
+        if (session.state === "closing" || session.appService !== appService) {
+            throw new Error("app context became unavailable");
+        }
         touchSession(session);
-        return session.appService;
+        return appService;
     };
 
     const resolveSessionAppId = async (session: MiniAppSession) => {
@@ -811,7 +842,7 @@ export const debug_server = (
             throw new Error("miniapp debug socket unavailable for close");
         }
 
-        const windowHandle = rememberMiniAppWindow(session);
+        const windowHandle = await waitForMiniAppWindow(session);
         if (windowHandle === undefined) {
             throw new Error("miniapp window handle unavailable for close");
         }

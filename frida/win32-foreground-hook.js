@@ -11,6 +11,11 @@ const findWin32Export = (moduleName, symbolName) => {
 const patchWin32WindowRecorder = () => {
     const createWindowExWPtr = findWin32Export("user32.dll", "CreateWindowExW");
     const createWindowExAPtr = findWin32Export("user32.dll", "CreateWindowExA");
+    const enumWindowsPtr = findWin32Export("user32.dll", "EnumWindows");
+    const getWindowThreadProcessIdPtr = findWin32Export(
+        "user32.dll",
+        "GetWindowThreadProcessId",
+    );
 
     if (!createWindowExWPtr && !createWindowExAPtr) {
         send("[hook] win32 window recorder skipped: CreateWindowEx unavailable");
@@ -18,6 +23,18 @@ const patchWin32WindowRecorder = () => {
     }
 
     const WS_CHILD = 0x40000000;
+    const NULL_HWND = ptr("0");
+    const currentPid = Process.id;
+
+    const emitRecordedWindow = (hwnd, apiName, parentHwnd) => {
+        send({
+            source: "win32-window-recorder",
+            event: "created",
+            api: apiName,
+            hwnd: hwnd.toString(),
+            parentHwnd: parentHwnd.toString(),
+        });
+    };
 
     const attachCreateWindowHook = (targetPtr, apiName) => {
         if (!targetPtr) {
@@ -34,19 +51,40 @@ const patchWin32WindowRecorder = () => {
                     return;
                 }
 
-                send({
-                    source: "win32-window-recorder",
-                    event: "created",
-                    api: apiName,
-                    hwnd: retval.toString(),
-                    parentHwnd: this.parentHwnd.toString(),
-                });
+                emitRecordedWindow(retval, apiName, this.parentHwnd);
             },
         });
     };
 
     attachCreateWindowHook(createWindowExWPtr, "CreateWindowExW");
     attachCreateWindowHook(createWindowExAPtr, "CreateWindowExA");
+
+    if (enumWindowsPtr && getWindowThreadProcessIdPtr) {
+        const enumWindows = new NativeFunction(enumWindowsPtr, "bool", [
+            "pointer",
+            "pointer",
+        ]);
+        const getWindowThreadProcessId = new NativeFunction(
+            getWindowThreadProcessIdPtr,
+            "uint",
+            ["pointer", "pointer"],
+        );
+        const enumProc = new NativeCallback(
+            (hwnd) => {
+                const pidOut = Memory.alloc(4);
+                getWindowThreadProcessId(hwnd, pidOut);
+                if (pidOut.readU32() === currentPid) {
+                    emitRecordedWindow(hwnd, "EnumWindows", NULL_HWND);
+                }
+                return true;
+            },
+            "bool",
+            ["pointer", "pointer"],
+        );
+        win32ForegroundHookCallbacks.push(enumProc);
+        enumWindows(enumProc, NULL_HWND);
+    }
+
     send("[hook] Win32 window recorder installed");
 };
 
