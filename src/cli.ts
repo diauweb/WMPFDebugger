@@ -19,7 +19,7 @@ const print_help = () => {
     console.log(`Usage: bun run src/index.ts [options]
 
 Options:
-  --debug-port <port>  Remote debug server port (default: ${DEBUG_PORT})
+  --debug-port <port>  Remote debug server port (fixed at ${DEBUG_PORT})
   --cdp-port <port>    CDP proxy server port (default: ${CDP_PORT})
   --sqlcipher-db-root <path>
                        Root folder for SQLCipher .db files
@@ -65,8 +65,19 @@ const parse_cli_options = (): CliOptions => {
         process.exit(0);
     }
 
+    const debugPort = parse_port(
+        "--debug-port",
+        values["debug-port"],
+        DEBUG_PORT,
+    );
+    if (debugPort !== DEBUG_PORT) {
+        throw new Error(
+            `[main] --debug-port must remain ${DEBUG_PORT}; the WMPF runtime endpoint is fixed`,
+        );
+    }
+
     return {
-        debugPort: parse_port("--debug-port", values["debug-port"], DEBUG_PORT),
+        debugPort,
         cdpPort: parse_port("--cdp-port", values["cdp-port"], CDP_PORT),
         sqlcipherDbRoot: values["sqlcipher-db-root"],
         debugMain: values["debug-main"] ?? false,

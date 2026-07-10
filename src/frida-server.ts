@@ -53,6 +53,7 @@ type MiniAppWindowClaimOptions = {
 
 type FridaServerHandle = {
     getStatus: () => FridaHookStatus;
+    waitUntilReady: (timeoutMs: number) => Promise<FridaHookStatus>;
     claimMiniAppWindow: (
         options?: MiniAppWindowClaimOptions,
     ) => MiniAppWindowHandle | undefined;
@@ -64,6 +65,7 @@ type RecordedMiniAppWindow = MiniAppWindowHandle & {
 
 const FRIDA_RETRY_INTERVAL_MS = 2_000;
 const FRIDA_HEALTHCHECK_INTERVAL_MS = 3_000;
+const FRIDA_READY_POLL_INTERVAL_MS = 100;
 const FRIDA_READY_MESSAGE = "[hook] interceptors installed";
 
 const toIsoString = (value?: number) =>
@@ -239,6 +241,8 @@ const attachFrida = async (
             }
 
             if (message.type === "error") {
+                runtime.phase = "error";
+                runtime.hookInstalled = false;
                 runtime.lastError = formatFridaMessageError(message);
                 logger.error("[frida client]", message);
                 requestReconnect();
@@ -267,6 +271,7 @@ const attachFrida = async (
             }
 
             runtime.hookInstalled = false;
+            runtime.phase = "error";
             runtime.lastError = "[frida] hook script destroyed";
             logger.info("[frida] hook script destroyed; scheduling rehook");
             requestReconnect();
@@ -277,6 +282,7 @@ const attachFrida = async (
             }
 
             runtime.hookInstalled = false;
+            runtime.phase = "error";
             runtime.lastError = crash
                 ? `[frida] session detached (${String(reason)}): ${crash.summary}`
                 : `[frida] session detached (${String(reason)})`;
@@ -494,6 +500,25 @@ export const start_frida_server = (logger: Logger): FridaServerHandle => {
 
     return {
         getStatus: () => buildStatusSnapshot(runtime, currentAttachment),
+        waitUntilReady: async (timeoutMs: number) => {
+            const deadline = Date.now() + timeoutMs;
+            let status = buildStatusSnapshot(runtime, currentAttachment);
+            while (
+                status.phase !== "hooked" ||
+                !status.active ||
+                !status.hookInstalled
+            ) {
+                const remaining = deadline - Date.now();
+                if (remaining <= 0) {
+                    const detail = status.lastError ??
+                        `phase=${status.phase}, active=${status.active}, hookInstalled=${status.hookInstalled}`;
+                    throw new Error(`Frida hook is not ready: ${detail}`);
+                }
+                await sleep(Math.min(FRIDA_READY_POLL_INTERVAL_MS, remaining));
+                status = buildStatusSnapshot(runtime, currentAttachment);
+            }
+            return status;
+        },
         claimMiniAppWindow,
     };
 };

@@ -9,7 +9,7 @@ type WeChatStatus = {
 
 type WeChatWindowHandle = {
     window: WeChatWindow;
-    handle: number | null;
+    handle: bigint | null;
 };
 
 const POINTER_SIZE = 8;
@@ -20,6 +20,10 @@ const LPDATA_OFFSET = 16;
 const WM_COPYDATA = 0x004a;
 const WM_CLOSE = 0x0010;
 const MINIAPP_LAUNCH_WPARAM = 0x2c96;
+const SEND_MESSAGE_TIMEOUT_MS = 45_000;
+const SMTO_BLOCK = 0x0001;
+const SMTO_ABORTIFHUNG = 0x0002;
+const SMTO_ERRORONEXIT = 0x0020;
 
 const MAIN_WINDOW_CLASS = "WeChatMainWndForPC";
 const LOGIN_WINDOW_CLASS = "WeChatLoginWndForPC";
@@ -29,23 +33,19 @@ const user32 =
         ? dlopen("user32.dll", {
               FindWindowW: {
                   args: ["ptr", "ptr"],
-                  returns: "ptr",
+                  returns: "u64",
               },
-              SendMessageW: {
-                  args: ["ptr", "u32", "u64", "ptr"],
+              SendMessageTimeoutW: {
+                  args: ["u64", "u32", "u64", "ptr", "u32", "u32", "ptr"],
                   returns: "i64",
               },
-              BringWindowToTop: {
-                  args: ["ptr"],
-                  returns: "bool",
-              },
               IsWindow: {
-                  args: ["ptr"],
-                  returns: "bool",
+                  args: ["u64"],
+                  returns: "i32",
               },
               PostMessageW: {
-                  args: ["ptr", "u32", "u64", "ptr"],
-                  returns: "bool",
+                  args: ["u64", "u32", "u64", "i64"],
+                  returns: "i32",
               },
           })
         : null;
@@ -61,7 +61,11 @@ const ensureWindows = () => {
 
 const encodeWideString = (value: string) => Buffer.from(`${value}\0`, "utf16le");
 
-const writePointer = (view: DataView, offset: number, value: number) => {
+const writePointer = (
+    view: DataView,
+    offset: number,
+    value: number | bigint,
+) => {
     view.setBigUint64(offset, BigInt(value), true);
 };
 
@@ -72,7 +76,7 @@ const getWeChatWindow = (): WeChatWindowHandle => {
     ensureWindows();
 
     const mainHandle = findWindowByClassName(MAIN_WINDOW_CLASS);
-    if (mainHandle !== null) {
+    if (mainHandle !== BigInt(0)) {
         return {
             window: "main",
             handle: mainHandle,
@@ -80,7 +84,7 @@ const getWeChatWindow = (): WeChatWindowHandle => {
     }
 
     const loginHandle = findWindowByClassName(LOGIN_WINDOW_CLASS);
-    if (loginHandle !== null) {
+    if (loginHandle !== BigInt(0)) {
         return {
             window: "login",
             handle: loginHandle,
@@ -93,11 +97,26 @@ const getWeChatWindow = (): WeChatWindowHandle => {
     };
 };
 
-const close_window = (handle: number) => {
+const toNativeHandle = (handle: number | bigint) => {
+    const normalizedHandle =
+        typeof handle === "bigint" ? handle : BigInt(Math.trunc(handle));
+    return normalizedHandle > BigInt(0) ? normalizedHandle : BigInt(0);
+};
+
+const is_window = (handle: number | bigint) => {
     ensureWindows();
 
-    const normalizedHandle = Number(handle);
-    if (!normalizedHandle || !user32.symbols.IsWindow(normalizedHandle)) {
+    const normalizedHandle = toNativeHandle(handle);
+    return Boolean(
+        normalizedHandle && user32.symbols.IsWindow(normalizedHandle),
+    );
+};
+
+const close_window = (handle: number | bigint) => {
+    ensureWindows();
+
+    const normalizedHandle = toNativeHandle(handle);
+    if (!is_window(normalizedHandle)) {
         throw new Error("window handle is unavailable");
     }
 
@@ -105,7 +124,7 @@ const close_window = (handle: number) => {
         normalizedHandle,
         WM_CLOSE,
         BigInt(0),
-        null,
+        BigInt(0),
     );
     if (!posted) {
         throw new Error(`failed to post WM_CLOSE to window ${normalizedHandle}`);
@@ -121,7 +140,7 @@ const encodeMiniAppLaunchPayload = (appid: string) =>
         "utf8",
     );
 
-const buildCopyData = (handle: number, payloadBytes: Buffer) => {
+const buildCopyData = (handle: bigint, payloadBytes: Buffer) => {
     const structBuffer = new ArrayBuffer(COPYDATASTRUCT_SIZE);
     const view = new DataView(structBuffer);
     writePointer(view, 0, handle);
@@ -140,8 +159,8 @@ const runBridge = async (
         return { window: status.window };
     }
 
-    if (status.window === "none" || status.handle === null) {
-        throw new Error("WeChat window not found");
+    if (status.window !== "main" || status.handle === null) {
+        throw new Error("WeChat main window is not available");
     }
 
     const normalizedAppId = appid?.trim() ?? "";
@@ -152,13 +171,19 @@ const runBridge = async (
     const payloadBytes = encodeMiniAppLaunchPayload(normalizedAppId);
     const copyData = buildCopyData(status.handle, payloadBytes);
 
-    user32.symbols.SendMessageW(
+    const messageResult = new BigUint64Array(1);
+    const delivered = user32.symbols.SendMessageTimeoutW(
         status.handle,
         WM_COPYDATA,
         BigInt(MINIAPP_LAUNCH_WPARAM),
         copyData,
+        SMTO_BLOCK | SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+        SEND_MESSAGE_TIMEOUT_MS,
+        messageResult,
     );
-    user32.symbols.BringWindowToTop(status.handle);
+    if (delivered === BigInt(0)) {
+        throw new Error("WM_COPYDATA send failed or timed out");
+    }
 
     return { window: status.window };
 };
@@ -169,6 +194,7 @@ const spawn_miniapp = (appid: string) => runBridge("spawn", appid);
 
 export {
     close_window,
+    is_window,
     get_wechat_status,
     spawn_miniapp,
     WeChatStatus,
