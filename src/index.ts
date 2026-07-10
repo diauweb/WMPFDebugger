@@ -1,6 +1,7 @@
 import { parse_cli_options } from "./cli";
+import { MiniAppLaunchCoordinator } from "./launch-coordinator";
 import { create_logger } from "./logger";
-import type { MiniAppSession, PendingSpawn } from "./session";
+import { MiniAppSessionRegistry } from "./session-registry";
 import { install_process_guards } from "./process-guards";
 
 const main = async () => {
@@ -9,8 +10,8 @@ const main = async () => {
     install_process_guards(logger);
     const { debug_server } = require("./debug-server") as typeof import("./debug-server");
     const { proxy_server } = require("./proxy-server") as typeof import("./proxy-server");
-    const sessions = new Map<string, MiniAppSession>();
-    const pendingSpawns = new Map<string, PendingSpawn>();
+    const launches = new MiniAppLaunchCoordinator();
+    const sessionRegistry = new MiniAppSessionRegistry(launches);
     const fridaServer = options.noFrida
         ? {
             getStatus: () => ({
@@ -25,6 +26,17 @@ const main = async () => {
                 lastError: "frida disabled",
             }),
             claimMiniAppWindow: () => undefined,
+            waitUntilReady: async () => ({
+                active: false,
+                phase: "waiting" as const,
+                pid: null,
+                version: null,
+                hookInstalled: false,
+                attachedAt: null,
+                lastHookEventAt: null,
+                lastHookMessage: null,
+                lastError: "frida disabled",
+            }),
         }
         : (() => {
             const { start_frida_server } = require("./frida-server") as typeof import("./frida-server");
@@ -33,15 +45,15 @@ const main = async () => {
     const debugServer = debug_server(
         options,
         logger,
-        sessions,
-        pendingSpawns,
+        sessionRegistry,
+        launches,
         fridaServer,
     );
     proxy_server(
         options,
         logger,
-        sessions,
-        pendingSpawns,
+        sessionRegistry,
+        launches,
         debugServer,
         fridaServer,
     );
