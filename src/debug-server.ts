@@ -151,13 +151,35 @@ export const debug_server = (
     );
     logger.info(`[server] debug server waiting for miniapp to connect...`);
 
-    const listDebuggableSessions = () =>
-        Array.from(sessions.values()).filter(
-            (session) =>
-                session.state === "ready" &&
-                session.debugSocket !== undefined &&
-                session.appService !== undefined,
-        );
+    const listDebuggableSessions = () => {
+        const selected = new Map<string, MiniAppSession>();
+        for (const session of new Set(sessions.values())) {
+            if (
+                session.state !== "ready" ||
+                session.debugSocket?.readyState !== WebSocket.OPEN ||
+                session.appService === undefined
+            ) {
+                continue;
+            }
+            const appid = session.requestedAppId ?? session.id;
+            const existing = selected.get(appid);
+            if (
+                !existing ||
+                session.evaluationSuccesses > existing.evaluationSuccesses ||
+                (session.evaluationSuccesses ===
+                    existing.evaluationSuccesses &&
+                    session.evaluationFailures < existing.evaluationFailures) ||
+                (session.evaluationSuccesses ===
+                    existing.evaluationSuccesses &&
+                    session.evaluationFailures ===
+                        existing.evaluationFailures &&
+                    session.createdAt < existing.createdAt)
+            ) {
+                selected.set(appid, session);
+            }
+        }
+        return Array.from(selected.values());
+    };
 
     const diagnosticSession = (session: MiniAppSession) => ({
         traceId: session.traceId,
@@ -177,8 +199,29 @@ export const debug_server = (
                 ? null
                 : `0x${session.windowHandle.toString(16)}`,
         identityVerified: session.windowIdentity !== undefined,
+        evaluationSuccesses: session.evaluationSuccesses,
+        evaluationFailures: session.evaluationFailures,
         debugSocketState: session.debugSocket?.readyState ?? null,
     });
+
+    const getFridaTransportRelation = (
+        transportPid: number | null,
+        status = fridaServer.getStatus(),
+    ) => {
+        if (transportPid === null || status.pid === null) {
+            return "unresolved" as const;
+        }
+        if (transportPid === status.pid) {
+            return "attached-process" as const;
+        }
+        if (
+            status.targetSelection?.selectedPid === status.pid &&
+            status.targetSelection.selectedChildPids.includes(transportPid)
+        ) {
+            return "attached-process-child" as const;
+        }
+        return "outside-attached-process-family" as const;
+    };
 
     const findAvailablePendingSpawn = () => {
         const pendingSpawnList = Array.from(pendingSpawns.values())
@@ -366,14 +409,14 @@ export const debug_server = (
     const classifyWindowCandidates = (breakdown: {
         afterCursor: number;
         withinTimeWindow: number;
-        transportPidMatches: number;
+        windowPidMatches: number;
         enumeratedWindows: number;
         eligible: number;
     }) => {
         if (breakdown.afterCursor === 0) return "create_event_absent";
         if (breakdown.withinTimeWindow === 0)
             return "create_event_outside_launch_window";
-        if (breakdown.transportPidMatches === 0)
+        if (breakdown.windowPidMatches === 0)
             return "create_event_pid_mismatch";
         if (breakdown.eligible === 0) return "candidate_not_enumerated";
         if (breakdown.eligible > 1) return "multiple_exact_candidates";
@@ -385,8 +428,13 @@ export const debug_server = (
         diagnostic: Awaited<
             ReturnType<typeof diagnoseWin32WindowIdentity>
         >,
-        fridaAttachedPid: number | null,
+        fridaStatus: ReturnType<typeof fridaServer.getStatus>,
     ) => {
+        const fridaAttachedPid = fridaStatus.pid;
+        const transportRelation = getFridaTransportRelation(
+            diagnostic.transportPid,
+            fridaStatus,
+        );
         const missing: string[] = [];
         if (!session.launchId) missing.push("launch_id_missing");
         if (session.launchStartedAt === undefined)
@@ -398,12 +446,8 @@ export const debug_server = (
         if (diagnostic.transportProcessStartTime === null)
             missing.push("transport_start_time_unresolved");
         if (fridaAttachedPid === null) missing.push("frida_pid_unresolved");
-        if (
-            fridaAttachedPid !== null &&
-            diagnostic.transportPid !== null &&
-            fridaAttachedPid !== diagnostic.transportPid
-        ) {
-            missing.push("frida_transport_pid_mismatch");
+        if (transportRelation === "outside-attached-process-family") {
+            missing.push("transport_outside_frida_process_family");
         }
         if (missing.length > 0) {
             emitMiniAppDiagnostic(logger, "hwnd_proof_skipped", {
@@ -411,6 +455,7 @@ export const debug_server = (
                 reasons: missing,
                 fridaPid: fridaAttachedPid,
                 transportPid: diagnostic.transportPid,
+                transportRelation,
             });
             return;
         }
@@ -419,6 +464,7 @@ export const debug_server = (
             diagnostic,
             session.launchWindowCursor!,
             session.launchStartedAt!,
+            fridaAttachedPid!,
         );
         emitMiniAppDiagnostic(logger, "hwnd_candidates_evaluated", {
             ...diagnosticSession(session),
@@ -437,6 +483,7 @@ export const debug_server = (
             enumeratedWindowCount: diagnostic.windows.length,
             fridaPid: fridaAttachedPid,
             transportPid: diagnostic.transportPid,
+            transportRelation,
         });
         if (eligible.length !== 1) {
             if (candidates.length > 0) {
@@ -449,6 +496,17 @@ export const debug_server = (
         }
 
         const { candidate, window, expectedHwnd } = eligible[0];
+        const windowProcessStartTime =
+            diagnostic.windowProcessStartTimes[String(window.pid)] ?? null;
+        if (windowProcessStartTime === null) {
+            emitMiniAppDiagnostic(logger, "hwnd_proof_skipped", {
+                ...diagnosticSession(session),
+                reasons: ["window_process_start_time_unresolved"],
+                hwnd: expectedHwnd,
+                windowPid: window.pid,
+            });
+            return;
+        }
         session.windowHandle = candidate.handle;
         session.windowIdentity = {
             handle: candidate.handle,
@@ -460,7 +518,7 @@ export const debug_server = (
             rootOwner: window.rootOwner,
             launchId: session.launchId!,
             fridaObservedAt: candidate.createdAt,
-            processStartTime: diagnostic.transportProcessStartTime!,
+            processStartTime: windowProcessStartTime,
             appIdConfirmed: session.launchAppIdConfirmed === true,
             verifiedAt: Date.now(),
         };
@@ -474,7 +532,7 @@ export const debug_server = (
             pid: window.pid,
             tid: window.tid,
             className: window.className,
-            processStartTime: diagnostic.transportProcessStartTime,
+            processStartTime: windowProcessStartTime,
             appIdConfirmed: session.windowIdentity!.appIdConfirmed,
         });
     };
@@ -485,6 +543,7 @@ export const debug_server = (
         >,
         windowCursor: number,
         launchStartedAt: number,
+        windowOwnerPid: number,
     ) => {
         const observedBefore = Date.parse(diagnostic.observedAt);
         const afterCursor = fridaServer.listMiniAppWindowCandidates({
@@ -497,7 +556,7 @@ export const debug_server = (
                     candidate.createdAt <= observedBefore),
         );
         const candidates = withinTimeWindow.filter(
-            (candidate) => candidate.pid === diagnostic.transportPid,
+            (candidate) => candidate.pid === windowOwnerPid,
         );
         const eligible = candidates.flatMap((candidate) => {
             if (candidate.threadId === undefined) {
@@ -507,7 +566,7 @@ export const debug_server = (
             const matches = diagnostic.windows.filter(
                 (window) =>
                     window.hwnd.toLowerCase() === expectedHwnd &&
-                    window.pid === diagnostic.transportPid &&
+                    window.pid === windowOwnerPid &&
                     window.tid === candidate.threadId,
             );
             return matches.length === 1
@@ -520,7 +579,7 @@ export const debug_server = (
             breakdown: {
                 afterCursor: afterCursor.length,
                 withinTimeWindow: withinTimeWindow.length,
-                transportPidMatches: candidates.length,
+                windowPidMatches: candidates.length,
                 enumeratedWindows: diagnostic.windows.length,
                 eligible: eligible.length,
             },
@@ -532,8 +591,13 @@ export const debug_server = (
         diagnostic: Awaited<
             ReturnType<typeof diagnoseWin32WindowIdentity>
         >,
-        fridaAttachedPid: number | null,
+        fridaStatus: ReturnType<typeof fridaServer.getStatus>,
     ) => {
+        const fridaAttachedPid = fridaStatus.pid;
+        const transportRelation = getFridaTransportRelation(
+            diagnostic.transportPid,
+            fridaStatus,
+        );
         if (session.launchId) {
             return;
         }
@@ -547,12 +611,8 @@ export const debug_server = (
         if (diagnostic.transportPid === null)
             reasons.push("transport_pid_unresolved");
         if (fridaAttachedPid === null) reasons.push("frida_pid_unresolved");
-        if (
-            fridaAttachedPid !== null &&
-            diagnostic.transportPid !== null &&
-            fridaAttachedPid !== diagnostic.transportPid
-        ) {
-            reasons.push("frida_transport_pid_mismatch");
+        if (transportRelation === "outside-attached-process-family") {
+            reasons.push("transport_outside_frida_process_family");
         }
         if (reasons.length > 0) {
             emitMiniAppDiagnostic(logger, "launch_window_bind_skipped", {
@@ -560,6 +620,7 @@ export const debug_server = (
                 reasons,
                 fridaPid: fridaAttachedPid,
                 transportPid: diagnostic.transportPid,
+                transportRelation,
             });
             return;
         }
@@ -577,6 +638,7 @@ export const debug_server = (
             diagnostic,
             pendingSpawn.windowCursor,
             pendingSpawn.createdAt,
+            fridaAttachedPid!,
         );
         if (eligible.length === 1) {
             bindPendingSpawn(session, pendingSpawn, "window");
@@ -591,6 +653,7 @@ export const debug_server = (
                 breakdown,
                 fridaPid: fridaAttachedPid,
                 transportPid: diagnostic.transportPid,
+                transportRelation,
             });
         }
     };
@@ -606,8 +669,16 @@ export const debug_server = (
         phase: "socket-connected" | "bootstrap-settled",
     ) => {
         try {
-            const diagnostic = await diagnoseWin32WindowIdentity(socket);
-            const fridaAttachedPid = fridaServer.getStatus().pid;
+            const fridaStatus = fridaServer.getStatus();
+            const fridaAttachedPid = fridaStatus.pid;
+            const diagnostic = await diagnoseWin32WindowIdentity(socket, {
+                additionalWindowPids:
+                    fridaAttachedPid === null ? [] : [fridaAttachedPid],
+            });
+            const transportRelation = getFridaTransportRelation(
+                diagnostic.transportPid,
+                fridaStatus,
+            );
             if (diagnostic.transportPid !== null) {
                 session.transportPid = diagnostic.transportPid;
                 touchSession(session);
@@ -615,12 +686,12 @@ export const debug_server = (
             bindPendingSpawnFromWindowEvidence(
                 session,
                 diagnostic,
-                fridaAttachedPid,
+                fridaStatus,
             );
             verifyWindowIdentityFromDiagnostic(
                 session,
                 diagnostic,
-                fridaAttachedPid,
+                fridaStatus,
             );
             emitMiniAppDiagnostic(logger, "identity_probe", {
                 ...diagnosticSession(session),
@@ -643,10 +714,8 @@ export const debug_server = (
                     fridaAttachedPid === null
                         ? "frida_pid_unresolved"
                         : null,
-                    fridaAttachedPid !== null &&
-                    diagnostic.transportPid !== null &&
-                    fridaAttachedPid !== diagnostic.transportPid
-                        ? "frida_transport_pid_mismatch"
+                    transportRelation === "outside-attached-process-family"
+                        ? "transport_outside_frida_process_family"
                         : null,
                 ].filter((reason): reason is string => reason !== null),
                 endpoint: describeSocketEndpoint(diagnostic.endpoint),
@@ -654,10 +723,14 @@ export const debug_server = (
                     pid: fridaAttachedPid,
                     phase: fridaServer.getStatus().phase,
                     hookInstalled: fridaServer.getStatus().hookInstalled,
+                    transportRelation,
                 },
                 transportPid: diagnostic.transportPid,
                 transportProcessStartTime:
                     diagnostic.transportProcessStartTime,
+                windowPids: diagnostic.windowPids,
+                windowProcessStartTimes:
+                    diagnostic.windowProcessStartTimes,
                 tcp: {
                     serverMatchCount: diagnostic.tcp.serverMatchCount,
                     serverMatchesByFamily:
@@ -876,7 +949,11 @@ export const debug_server = (
                 return;
             }
 
-            void applyForegroundState(session, appService);
+            void applyForegroundState(session, appService).catch((error) => {
+                logger.info(
+                    `[miniapp] foreground keepalive paused for ${session.id}: ${formatErrorMessage(error)}`,
+                );
+            });
         }, FOREGROUND_KEEP_ALIVE_MS);
         session.foregroundKeepAlive.unref();
     };
@@ -982,18 +1059,20 @@ export const debug_server = (
             options?.forceContextRefresh ||
             options?.forceAttach
         ) {
-            const contextPromise = waitForExecutionContext(
-                session,
-                appServiceSessionId,
-                frameId,
-            );
-            await sendInternalCommand(
-                session,
-                "Runtime.enable",
-                {},
-                appServiceSessionId,
-            );
-            contextId = await contextPromise;
+            const [resolvedContextId] = await Promise.all([
+                waitForExecutionContext(
+                    session,
+                    appServiceSessionId,
+                    frameId,
+                ),
+                sendInternalCommand(
+                    session,
+                    "Runtime.enable",
+                    {},
+                    appServiceSessionId,
+                ),
+            ]);
+            contextId = resolvedContextId;
         }
 
         const appService = {
@@ -1092,16 +1171,35 @@ export const debug_server = (
         };
 
         try {
-            return await sendEvaluate(false);
-        } catch (error) {
-            if (!isRecoverableAppContextError(error)) {
-                throw error;
-            }
+            let result;
+            try {
+                result = await sendEvaluate(false);
+            } catch (error) {
+                if (!isRecoverableAppContextError(error)) {
+                    throw error;
+                }
 
-            logger.info(
-                `[miniapp] refreshing appContext for ${session.id} after evaluate failure`,
-            );
-            return sendEvaluate(true);
+                logger.info(
+                    `[miniapp] refreshing appContext for ${session.id} after evaluate failure`,
+                );
+                result = await sendEvaluate(true);
+            }
+            session.evaluationSuccesses += 1;
+            session.lastEvaluationSucceededAt = Date.now();
+            touchSession(session);
+            emitMiniAppDiagnostic(logger, "attachment_evaluate_succeeded", {
+                ...diagnosticSession(session),
+            });
+            return result;
+        } catch (error) {
+            session.evaluationFailures += 1;
+            session.lastEvaluationFailedAt = Date.now();
+            touchSession(session);
+            emitMiniAppDiagnostic(logger, "attachment_evaluate_failed", {
+                error,
+                ...diagnosticSession(session),
+            });
+            throw error;
         }
     };
 
@@ -1110,22 +1208,174 @@ export const debug_server = (
             if (!sessions.has(appid)) {
                 sessions.set(appid, session);
             }
-            return true;
+            return "canonical" as const;
         }
 
         const existing = sessions.get(appid);
         if (existing && existing !== session) {
-            logger.error(
-                `[miniapp] duplicate live session for ${appid}: ${existing.id} and ${session.id}`,
+            const existingUsable =
+                existing.state === "ready" &&
+                existing.debugSocket?.readyState === WebSocket.OPEN &&
+                existing.appService !== undefined;
+            if (existingUsable) {
+                logger.info(
+                    `[miniapp] alternate attachment ready for ${appid}: keeping canonical ${existing.traceId}, candidate ${session.traceId}`,
+                );
+                emitMiniAppDiagnostic(logger, "attachment_candidate_ready", {
+                    appid,
+                    disposition: "alternate",
+                    canonicalTraceId: existing.traceId,
+                    candidateTraceId: session.traceId,
+                    sameTransportPid:
+                        existing.transportPid !== undefined &&
+                        existing.transportPid === session.transportPid,
+                    ...diagnosticSession(session),
+                });
+                return "alternate" as const;
+            }
+
+            if (
+                existing.transportPid !== undefined &&
+                existing.transportPid === session.transportPid
+            ) {
+                session.launchId ??= existing.launchId;
+                session.launchStartedAt ??= existing.launchStartedAt;
+                session.launchWindowCursor ??= existing.launchWindowCursor;
+                session.launchAppIdConfirmed ||= existing.launchAppIdConfirmed;
+                session.windowHandle ??= existing.windowHandle;
+                session.windowIdentity ??= existing.windowIdentity;
+            }
+            sessions.delete(appid);
+            existing.state = "closing";
+            existing.lastError = "superseded by a working attachment";
+            stopForegroundKeepAlive(existing);
+            touchSession(existing);
+            logger.info(
+                `[miniapp] replacing stale attachment for ${appid}: ${existing.traceId} -> ${session.traceId}`,
             );
-            return false;
+            emitMiniAppDiagnostic(logger, "attachment_candidate_ready", {
+                appid,
+                disposition: "replaced-stale-canonical",
+                canonicalTraceId: existing.traceId,
+                candidateTraceId: session.traceId,
+                ...diagnosticSession(session),
+            });
         }
 
         const previousId = session.id;
         sessions.delete(previousId);
         session.id = appid;
         sessions.set(appid, session);
-        return true;
+        return "canonical" as const;
+    };
+
+    const promoteSessionAttachment = (
+        appid: string,
+        candidate: MiniAppSession,
+    ) => {
+        const canonical = sessions.get(appid);
+        const candidateSocket = candidate.debugSocket;
+        if (
+            !canonical ||
+            canonical === candidate ||
+            candidate.state !== "ready" ||
+            !candidate.appService ||
+            !candidateSocket ||
+            candidateSocket.readyState !== WebSocket.OPEN
+        ) {
+            return canonical ?? candidate;
+        }
+
+        const oldSocket = canonical.debugSocket;
+        const oldDevtoolsSocket = canonical.devtoolsSocket;
+        stopForegroundKeepAlive(canonical);
+        stopForegroundKeepAlive(candidate);
+        rejectPendingWork(
+            canonical,
+            "miniapp attachment superseded by a successful candidate",
+        );
+
+        canonical.debugSocket = candidateSocket;
+        canonical.appService = candidate.appService;
+        canonical.transportPid = candidate.transportPid;
+        canonical.state = "ready";
+        canonical.lastError = undefined;
+        canonical.messageCounter = Math.max(
+            canonical.messageCounter,
+            candidate.messageCounter,
+        );
+        canonical.internalCommandCounter = Math.max(
+            canonical.internalCommandCounter,
+            candidate.internalCommandCounter,
+        );
+        canonical.evaluationSuccesses += candidate.evaluationSuccesses;
+        canonical.evaluationFailures += candidate.evaluationFailures;
+        canonical.lastEvaluationSucceededAt =
+            candidate.lastEvaluationSucceededAt;
+        canonical.lastEvaluationFailedAt = candidate.lastEvaluationFailedAt;
+        canonical.windowHandle ??= candidate.windowHandle;
+        canonical.windowIdentity ??= candidate.windowIdentity;
+        canonical.launchId ??= candidate.launchId;
+        canonical.launchStartedAt ??= candidate.launchStartedAt;
+        canonical.launchWindowCursor ??= candidate.launchWindowCursor;
+        canonical.launchAppIdConfirmed ||= candidate.launchAppIdConfirmed;
+
+        if (!canonical.devtoolsSocket && candidate.devtoolsSocket) {
+            canonical.devtoolsSocket = candidate.devtoolsSocket;
+            canonical.attached = candidate.attached;
+        } else if (
+            candidate.devtoolsSocket &&
+            candidate.devtoolsSocket !== canonical.devtoolsSocket
+        ) {
+            closeWebSocket(
+                candidate.devtoolsSocket,
+                1001,
+                "alternate miniapp attachment superseded",
+            );
+        }
+
+        debugSocketSessions.set(candidateSocket, canonical);
+        candidate.debugSocket = undefined;
+        candidate.devtoolsSocket = undefined;
+        candidate.appService = undefined;
+        candidate.attached = false;
+        candidate.state = "closing";
+        candidate.lastError = "promoted into canonical attachment";
+        removeSession(candidate);
+        touchSession(candidate);
+        touchSession(canonical);
+        startForegroundKeepAlive(canonical);
+
+        if (oldSocket && oldSocket !== candidateSocket) {
+            debugSocketSessions.delete(oldSocket);
+            closeWebSocket(
+                oldSocket,
+                1001,
+                "superseded by a working miniapp attachment",
+            );
+        }
+        if (
+            oldDevtoolsSocket &&
+            canonical.devtoolsSocket !== oldDevtoolsSocket
+        ) {
+            closeWebSocket(
+                oldDevtoolsSocket,
+                1001,
+                "miniapp attachment changed",
+            );
+        }
+
+        logger.info(
+            `[miniapp] promoted successful attachment for ${appid}: ${candidate.traceId} -> ${canonical.traceId}`,
+        );
+        emitMiniAppDiagnostic(logger, "attachment_promoted", {
+            appid,
+            canonicalTraceId: canonical.traceId,
+            candidateTraceId: candidate.traceId,
+            replacedSocket: oldSocket !== undefined,
+            ...diagnosticSession(canonical),
+        });
+        return canonical;
     };
 
     const bootstrapSession = async (session: MiniAppSession) => {
@@ -1170,11 +1420,7 @@ export const debug_server = (
             if (appid) {
                 session.title = appid;
                 session.requestedAppId = appid;
-                if (!rekeySessionByAppId(session, appid)) {
-                    throw new Error(
-                        `duplicate live session for ${appid}; refusing to publish the duplicate`,
-                    );
-                }
+                rekeySessionByAppId(session, appid);
             }
             if (!launchMismatch) {
                 session.launchAppIdConfirmed = true;
@@ -1699,6 +1945,7 @@ export const debug_server = (
         listDebuggableSessions,
         killMiniApp,
         evaluateInAppContext,
+        promoteSessionAttachment,
         sendMiniAppCdpMessage,
     };
 };

@@ -37,6 +37,7 @@ export const proxy_server = (
 ) => {
     const pageWss = new WebSocketServer({ noServer: true });
     const legacyWss = new WebSocketServer({ noServer: true });
+    const evaluationTails = new Map<string, Promise<void>>();
     const sqlcipherService = create_sqlcipher_service(
         logger,
         options.sqlcipherDbRoot,
@@ -88,22 +89,83 @@ export const proxy_server = (
             .listDebuggableSessions()
             .sort((left, right) => left.createdAt - right.createdAt);
 
+    const listSessionCandidates = (sessionId: string) =>
+        Array.from(new Set(sessions.values()))
+            .filter(
+                (session) =>
+                    session.id === sessionId ||
+                    session.requestedAppId === sessionId,
+            )
+            .sort((left, right) => {
+                const leftReady =
+                    left.state === "ready" &&
+                    left.debugSocket?.readyState === WebSocket.OPEN &&
+                    left.appService !== undefined;
+                const rightReady =
+                    right.state === "ready" &&
+                    right.debugSocket?.readyState === WebSocket.OPEN &&
+                    right.appService !== undefined;
+                if (leftReady !== rightReady) {
+                    return leftReady ? -1 : 1;
+                }
+                const leftLastSuccess =
+                    left.lastEvaluationSucceededAt ?? 0;
+                const rightLastSuccess =
+                    right.lastEvaluationSucceededAt ?? 0;
+                if (leftLastSuccess !== rightLastSuccess) {
+                    return rightLastSuccess - leftLastSuccess;
+                }
+                if (left.evaluationFailures !== right.evaluationFailures) {
+                    return left.evaluationFailures - right.evaluationFailures;
+                }
+                return left.createdAt - right.createdAt;
+            });
+
     const findSession = (sessionId: string) =>
-        sessions.get(sessionId) ??
-        Array.from(sessions.values()).find(
-            (session) => session.requestedAppId === sessionId,
+        listSessionCandidates(sessionId)[0];
+
+    const findCloseSession = (sessionId: string) =>
+        listSessionCandidates(sessionId).sort((left, right) => {
+            const proofScore = (session: MiniAppSession) =>
+                (session.windowIdentity ? 8 : 0) +
+                (session.windowIdentity?.appIdConfirmed ? 4 : 0) +
+                (session.windowHandle !== undefined ? 2 : 0) +
+                (session.launchId ? 1 : 0);
+            return proofScore(right) - proofScore(left);
+        })[0];
+
+    const listReadySessions = (appid: string) =>
+        listSessionCandidates(appid).filter(
+            (session) =>
+                session.state === "ready" &&
+                session.debugSocket?.readyState === WebSocket.OPEN &&
+                session.appService !== undefined,
         );
 
     const getReadySession = (appid: string) => {
-        const session = findSession(appid);
-        if (
-            session?.state !== "ready" ||
-            !session.debugSocket ||
-            !session.appService
-        ) {
-            return undefined;
+        return listReadySessions(appid)[0];
+    };
+
+    const withAppEvaluationLock = async <T>(
+        appid: string,
+        operation: () => Promise<T>,
+    ) => {
+        const previous = evaluationTails.get(appid) ?? Promise.resolve();
+        let release = () => {};
+        const gate = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        const queued = previous.catch(() => undefined).then(() => gate);
+        evaluationTails.set(appid, queued);
+        await previous.catch(() => undefined);
+        try {
+            return await operation();
+        } finally {
+            release();
+            if (evaluationTails.get(appid) === queued) {
+                evaluationTails.delete(appid);
+            }
         }
-        return session;
     };
 
     const findOtherPendingSpawn = (appid: string) =>
@@ -590,25 +652,75 @@ export const proxy_server = (
                 }
             }
 
-            try {
-                const result = await debugServer.evaluateInAppContext(
-                    session,
-                    expression,
-                );
-                sendJson(response, 200, result);
-            } catch (error) {
-                logger.error(
-                    `[api] appContext evaluate failed (${session.id}):`,
-                    error,
-                );
+            await withAppEvaluationLock(appid, async () => {
+                const preferredSession = getReadySession(appid) ?? session;
+                const candidates = listReadySessions(appid);
+                if (!candidates.includes(preferredSession)) {
+                    candidates.unshift(preferredSession);
+                }
+                const failures: Array<{
+                    traceId: string;
+                    sessionId: string;
+                    message: string;
+                }> = [];
+                for (const candidate of candidates) {
+                    try {
+                        emitMiniAppDiagnostic(
+                            logger,
+                            "evaluate_attachment_attempt",
+                            {
+                                appid,
+                                traceId: candidate.traceId,
+                                sessionId: candidate.id,
+                                evaluationSuccesses:
+                                    candidate.evaluationSuccesses,
+                                evaluationFailures:
+                                    candidate.evaluationFailures,
+                            },
+                        );
+                        const result =
+                            await debugServer.evaluateInAppContext(
+                                candidate,
+                                expression,
+                            );
+                        const activeSession =
+                            debugServer.promoteSessionAttachment(
+                                appid,
+                                candidate,
+                            );
+                        sendJson(response, 200, {
+                            ...result,
+                            attachment: {
+                                traceId: activeSession.traceId,
+                                attempted: failures.length + 1,
+                            },
+                        });
+                        return;
+                    } catch (error) {
+                        const message =
+                            error instanceof Error
+                                ? error.message
+                                : String(error);
+                        failures.push({
+                            traceId: candidate.traceId,
+                            sessionId: candidate.id,
+                            message,
+                        });
+                        logger.error(
+                            `[api] appContext evaluate candidate failed (${candidate.id}, ${candidate.traceId}):`,
+                            error,
+                        );
+                    }
+                }
                 sendJson(response, 500, {
-                    error: "failed to evaluate in appContext",
-                    miniappId: session.id,
+                    error: "all miniapp attachments failed to evaluate in appContext",
+                    miniappId: preferredSession.id,
+                    attemptedAttachments: failures,
                     miniappClosed: false,
                     forcedClose: false,
                     sessionRetained: true,
                 });
-            }
+            });
             return;
         }
 
@@ -622,7 +734,7 @@ export const proxy_server = (
                 return;
             }
 
-            const session = findSession(sessionId);
+            const session = findCloseSession(sessionId);
             if (!session) {
                 if (pendingSpawns.has(sessionId)) {
                     rejectPendingSpawn(

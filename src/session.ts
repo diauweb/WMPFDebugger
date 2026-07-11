@@ -80,6 +80,10 @@ export type MiniAppSession = {
     launchStartedAt?: number;
     launchWindowCursor?: number;
     launchAppIdConfirmed?: boolean;
+    evaluationSuccesses: number;
+    evaluationFailures: number;
+    lastEvaluationSucceededAt?: number;
+    lastEvaluationFailedAt?: number;
     messageCounter: number;
     internalCommandCounter: number;
     pendingCommands: Map<number, PendingCommand>;
@@ -144,6 +148,8 @@ export const createSession = (appid?: string): MiniAppSession => ({
     updatedAt: Date.now(),
     messageCounter: 0,
     internalCommandCounter: INTERNAL_CDP_ID_BASE,
+    evaluationSuccesses: 0,
+    evaluationFailures: 0,
     pendingCommands: new Map(),
     pendingContexts: new Map(),
     closeWaiters: new Set(),
@@ -165,7 +171,7 @@ export const flattenFrameTree = (tree?: CdpFrameTree): CdpFrameTree["frame"][] =
 export const serializeSession = (options: CliOptions, session: MiniAppSession) => ({
     traceId: session.traceId,
     id: session.id,
-    appid: session.id,
+    appid: session.requestedAppId ?? session.id,
     requestedAppId: session.requestedAppId ?? null,
     state: session.state,
     lastError: session.lastError ?? null,
@@ -175,6 +181,16 @@ export const serializeSession = (options: CliOptions, session: MiniAppSession) =
             : `0x${session.windowHandle.toString(16)}`,
     transportPid: session.transportPid ?? null,
     windowIdentityVerified: session.windowIdentity !== undefined,
+    evaluationSuccesses: session.evaluationSuccesses,
+    evaluationFailures: session.evaluationFailures,
+    lastEvaluationSucceededAt:
+        session.lastEvaluationSucceededAt === undefined
+            ? null
+            : new Date(session.lastEvaluationSucceededAt).toISOString(),
+    lastEvaluationFailedAt:
+        session.lastEvaluationFailedAt === undefined
+            ? null
+            : new Date(session.lastEvaluationFailedAt).toISOString(),
     attached: session.attached,
     createdAt: new Date(session.createdAt).toISOString(),
     targetUrl:

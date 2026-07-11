@@ -17,6 +17,10 @@ type SocketEndpoint = {
     remotePort?: number;
 };
 
+type Win32WindowDiagnosticOptions = {
+    additionalWindowPids?: number[];
+};
+
 type TcpFamily = "ipv4" | "ipv6";
 
 type TcpRow = {
@@ -73,6 +77,8 @@ type Win32WindowDiagnostic = {
     serverPid: number;
     transportPid: number | null;
     transportProcessStartTime: string | null;
+    windowPids: number[];
+    windowProcessStartTimes: Record<string, string | null>;
     tcp: {
         serverMatchCount: number;
         serverMatchesByFamily: Record<TcpFamily, number>;
@@ -381,7 +387,7 @@ const inventoryTopLevelWindows = (
         ptr: unknown;
         close: () => void;
     },
-    transportPid: number,
+    targetPids: ReadonlySet<number>,
 ): { windows: Win32WindowSnapshot[]; errors: string[] } => {
     const windows: Win32WindowSnapshot[] = [];
     const errors: string[] = [];
@@ -391,7 +397,7 @@ const inventoryTopLevelWindows = (
             try {
                 const pid = new Uint32Array(1);
                 const tid = Number(symbols.GetWindowThreadProcessId(hwnd, pid));
-                if (pid[0] !== transportPid) {
+                if (!targetPids.has(pid[0])) {
                     return 1;
                 }
 
@@ -563,6 +569,7 @@ const readProcessStartTime = (pid: number) => {
  */
 const diagnoseWin32WindowIdentity = async (
     socket: SocketEndpoint,
+    options: Win32WindowDiagnosticOptions = {},
 ): Promise<Win32WindowDiagnostic> => {
     const endpoint = normalizeEndpoint(socket);
     const result: Win32WindowDiagnostic = {
@@ -572,6 +579,8 @@ const diagnoseWin32WindowIdentity = async (
         serverPid: process.pid,
         transportPid: null,
         transportProcessStartTime: null,
+        windowPids: [],
+        windowProcessStartTimes: {},
         tcp: {
             serverMatchCount: 0,
             serverMatchesByFamily: { ipv4: 0, ipv6: 0 },
@@ -677,11 +686,39 @@ const diagnoseWin32WindowIdentity = async (
 
     let user32: ReturnType<typeof dlopen> | null = null;
     try {
+        const windowPids = new Set<number>([result.transportPid]);
+        for (const pid of options.additionalWindowPids ?? []) {
+            if (Number.isSafeInteger(pid) && pid > 0) {
+                windowPids.add(pid);
+            }
+        }
+        result.windowPids = Array.from(windowPids).sort(
+            (left, right) => left - right,
+        );
+        for (const pid of result.windowPids) {
+            if (
+                pid === result.transportPid &&
+                result.transportProcessStartTime !== null
+            ) {
+                result.windowProcessStartTimes[String(pid)] =
+                    result.transportProcessStartTime;
+                continue;
+            }
+            try {
+                result.windowProcessStartTimes[String(pid)] =
+                    readProcessStartTime(pid);
+            } catch (error) {
+                result.windowProcessStartTimes[String(pid)] = null;
+                result.errors.push(
+                    `window-owner process start-time lookup failed for ${pid}: ${getErrorMessage(error)}`,
+                );
+            }
+        }
         user32 = openUser32();
         const inventory = inventoryTopLevelWindows(
             user32.symbols,
             JSCallback,
-            result.transportPid,
+            windowPids,
         );
         result.windows = inventory.windows;
         result.errors.push(...inventory.errors);
@@ -742,7 +779,7 @@ const inspectWin32WindowIdentity = (
         const inventory = inventoryTopLevelWindows(
             user32.symbols,
             JSCallback,
-            expectedPid,
+            new Set([expectedPid]),
         );
         result.errors.push(...inventory.errors);
         const expectedHwnd = `0x${normalizedHandle.toString(16)}`;
@@ -769,6 +806,7 @@ export {
     diagnoseWin32WindowIdentity,
     inspectWin32WindowIdentity,
     SocketEndpoint,
+    Win32WindowDiagnosticOptions,
     Win32WindowDiagnostic,
     Win32WindowInspection,
     Win32WindowSnapshot,

@@ -9,8 +9,13 @@ type ResolvedWeChatTarget = {
     pid: number;
     version: number;
     selection: {
-        candidates: Array<{ pid: number; childCount: number }>;
+        candidates: Array<{
+            pid: number;
+            childCount: number;
+            childPids: number[];
+        }>;
         selectedChildCount: number;
+        selectedChildPids: number[];
         tieCount: number;
     };
 };
@@ -35,8 +40,13 @@ type FridaRuntimeState = {
     targetSelection?: {
         resolvedAt: number;
         selectedPid: number;
-        candidates: Array<{ pid: number; childCount: number }>;
+        candidates: Array<{
+            pid: number;
+            childCount: number;
+            childPids: number[];
+        }>;
         selectedChildCount: number;
+        selectedChildPids: number[];
         tieCount: number;
     };
 };
@@ -54,8 +64,13 @@ type FridaHookStatus = {
     targetSelection: {
         resolvedAt: string;
         selectedPid: number;
-        candidates: Array<{ pid: number; childCount: number }>;
+        candidates: Array<{
+            pid: number;
+            childCount: number;
+            childPids: number[];
+        }>;
         selectedChildCount: number;
+        selectedChildPids: number[];
         tieCount: number;
     } | null;
 };
@@ -180,7 +195,7 @@ const resolveWeChatTarget = async (
     const processes = await localDevice.enumerateProcesses({
         scope: frida.Scope.Metadata,
     });
-    const parentPidCounts = new Map<number, number>();
+    const childPidsByParent = new Map<number, number[]>();
     for (const processInfo of processes) {
         if (processInfo.name !== "WeChatAppEx.exe") {
             continue;
@@ -191,15 +206,15 @@ const resolveWeChatTarget = async (
             continue;
         }
 
-        parentPidCounts.set(
-            parentPid,
-            (parentPidCounts.get(parentPid) ?? 0) + 1,
-        );
+        const childPids = childPidsByParent.get(parentPid) ?? [];
+        childPids.push(processInfo.pid);
+        childPidsByParent.set(parentPid, childPids);
     }
 
     let wmpfPid: number | undefined;
     let wmpfPidCount = 0;
-    for (const [parentPid, count] of parentPidCounts.entries()) {
+    for (const [parentPid, childPids] of childPidsByParent.entries()) {
+        const count = childPids.length;
         if (count >= wmpfPidCount) {
             wmpfPid = parentPid;
             wmpfPidCount = count;
@@ -229,12 +244,19 @@ const resolveWeChatTarget = async (
         pid: wmpfPid,
         version: wmpfVersion,
         selection: {
-            candidates: Array.from(parentPidCounts.entries())
-                .map(([pid, childCount]) => ({ pid, childCount }))
+            candidates: Array.from(childPidsByParent.entries())
+                .map(([pid, childPids]) => ({
+                    pid,
+                    childCount: childPids.length,
+                    childPids: [...childPids].sort((left, right) => left - right),
+                }))
                 .sort((left, right) => left.pid - right.pid),
             selectedChildCount: wmpfPidCount,
-            tieCount: Array.from(parentPidCounts.values()).filter(
-                (count) => count === wmpfPidCount,
+            selectedChildPids: [
+                ...(childPidsByParent.get(wmpfPid) ?? []),
+            ].sort((left, right) => left - right),
+            tieCount: Array.from(childPidsByParent.values()).filter(
+                (childPids) => childPids.length === wmpfPidCount,
             ).length,
         },
     };
@@ -459,8 +481,14 @@ const buildStatusSnapshot = (
                   runtime.targetSelection.resolvedAt,
               ).toISOString(),
               candidates: runtime.targetSelection.candidates.map(
-                  (candidate) => ({ ...candidate }),
+                  (candidate) => ({
+                      ...candidate,
+                      childPids: [...candidate.childPids],
+                  }),
               ),
+              selectedChildPids: [
+                  ...runtime.targetSelection.selectedChildPids,
+              ],
           }
         : null,
 });
@@ -621,6 +649,12 @@ export const start_frida_server = (logger: Logger): FridaServerHandle => {
                     await sleep(FRIDA_RETRY_INTERVAL_MS);
                     continue;
                 }
+
+                runtime.targetSelection = {
+                    resolvedAt: Date.now(),
+                    selectedPid: target.pid,
+                    ...target.selection,
+                };
 
                 lastWaitingReason = undefined;
 
