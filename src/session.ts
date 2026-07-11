@@ -33,16 +33,35 @@ export type AppServiceBinding = {
     contextId: number;
 };
 
+export type MiniAppWindowIdentity = {
+    handle: number;
+    pid: number;
+    tid: number;
+    className: string;
+    owner: string | null;
+    root: string | null;
+    rootOwner: string | null;
+    launchId: string;
+    fridaObservedAt: number;
+    processStartTime: string;
+    appIdConfirmed: boolean;
+    verifiedAt: number;
+};
+
 export type MiniAppSessionState = "bootstrapping" | "ready" | "closing";
 
 export type PendingSpawn = {
+    id: string;
     appid: string;
     createdAt: number;
+    windowCursor: number;
+    boundSessionId?: string;
     timeout: NodeJS.Timeout;
     waiters: Set<PendingSpawnWaiter>;
 };
 
 export type MiniAppSession = {
+    traceId: string;
     id: string;
     title: string;
     requestedAppId?: string;
@@ -54,7 +73,13 @@ export type MiniAppSession = {
     debugSocket?: WebSocket;
     devtoolsSocket?: WebSocket;
     windowHandle?: number;
+    windowIdentity?: MiniAppWindowIdentity;
+    transportPid?: number;
+    closeInProgress?: boolean;
+    launchId?: string;
     launchStartedAt?: number;
+    launchWindowCursor?: number;
+    launchAppIdConfirmed?: boolean;
     messageCounter: number;
     internalCommandCounter: number;
     pendingCommands: Map<number, PendingCommand>;
@@ -75,7 +100,7 @@ export type CdpFrameTree = {
 
 export const INTERNAL_CDP_ID_BASE = 1_000_000_000;
 export const INTERNAL_CDP_TIMEOUT_MS = 5_000;
-export const PENDING_SPAWN_TIMEOUT_MS = 15_000;
+export const PENDING_SPAWN_TIMEOUT_MS = 45_000;
 
 export const bufferToHexString = (buffer: Buffer) => {
     return Array.from(buffer)
@@ -109,6 +134,7 @@ const getSessionId = (appid?: string) => {
 };
 
 export const createSession = (appid?: string): MiniAppSession => ({
+    traceId: randomUUID(),
     id: getSessionId(appid),
     title: appid || "miniapp",
     requestedAppId: appid,
@@ -137,6 +163,7 @@ export const flattenFrameTree = (tree?: CdpFrameTree): CdpFrameTree["frame"][] =
 };
 
 export const serializeSession = (options: CliOptions, session: MiniAppSession) => ({
+    traceId: session.traceId,
     id: session.id,
     appid: session.id,
     requestedAppId: session.requestedAppId ?? null,
@@ -146,6 +173,8 @@ export const serializeSession = (options: CliOptions, session: MiniAppSession) =
         session.windowHandle === undefined
             ? null
             : `0x${session.windowHandle.toString(16)}`,
+    transportPid: session.transportPid ?? null,
+    windowIdentityVerified: session.windowIdentity !== undefined,
     attached: session.attached,
     createdAt: new Date(session.createdAt).toISOString(),
     targetUrl:

@@ -1,10 +1,16 @@
 import WebSocket, { RawData, WebSocketServer } from "ws";
+import { isIP } from "node:net";
 
 import { CliOptions } from "./cli";
 import type { FridaServerHandle } from "./frida-server";
 import { Logger } from "./logger";
+import { emitMiniAppDiagnostic } from "./miniapp-diagnostics";
 import { report_fatal_error } from "./process-guards";
-import { close_window } from "./wechat-host";
+import { close_window, is_window } from "./wechat-host";
+import {
+    diagnoseWin32WindowIdentity,
+    inspectWin32WindowIdentity,
+} from "./win32-window-diagnostics";
 import {
     MiniAppSession,
     AppServiceBinding,
@@ -22,8 +28,6 @@ import {
 const codex = require("./third-party/RemoteDebugCodex.js");
 const messageProto = require("./third-party/WARemoteDebugProtobuf.js");
 const FOREGROUND_KEEP_ALIVE_MS = 3_000;
-const MINIAPP_WINDOW_CLAIM_GRACE_MS = 1_000;
-const MINIAPP_WINDOW_WAIT_MS = 2_000;
 const MINIAPP_WINDOW_WAIT_INTERVAL_MS = 100;
 
 const ACCOUNT_INFO_EXPRESSION = `
@@ -57,6 +61,61 @@ const isRecoverableAppContextError = (error: unknown) => {
 const formatErrorMessage = (error: unknown) =>
     error instanceof Error ? error.message : String(error ?? "");
 
+const describeSocketAddress = (address?: string) => {
+    const normalized = address?.toLowerCase().split("%")[0] ?? "";
+    const version = isIP(normalized);
+    let kind = "other";
+    if (
+        normalized === "127.0.0.1" ||
+        normalized.startsWith("127.") ||
+        normalized === "::1" ||
+        normalized.startsWith("::ffff:127.")
+    ) {
+        kind = "loopback";
+    } else if (normalized === "0.0.0.0" || normalized === "::") {
+        kind = "unspecified";
+    } else if (!normalized) {
+        kind = "unavailable";
+    }
+    return {
+        family: version === 4 ? "ipv4" : version === 6 ? "ipv6" : "unknown",
+        kind,
+    };
+};
+
+const describeSocketEndpoint = (socket: {
+    localAddress?: string;
+    localPort?: number;
+    remoteAddress?: string;
+    remotePort?: number;
+}) => ({
+    localPort: socket.localPort ?? null,
+    remotePort: socket.remotePort ?? null,
+    localAddress: describeSocketAddress(socket.localAddress),
+    remoteAddress: describeSocketAddress(socket.remoteAddress),
+});
+
+const describeTcpRow = (row: {
+    family: string;
+    state: number;
+    localScopeId: number;
+    localPort: number;
+    remoteScopeId: number;
+    remotePort: number;
+    ownerPid: number;
+} | null) =>
+    row
+        ? {
+              family: row.family,
+              state: row.state,
+              localScopeId: row.localScopeId,
+              localPort: row.localPort,
+              remoteScopeId: row.remoteScopeId,
+              remotePort: row.remotePort,
+              ownerPid: row.ownerPid,
+          }
+        : null;
+
 const shouldDisableForegroundCommand = (error: unknown) => {
     const message = formatErrorMessage(error);
     return (
@@ -73,7 +132,12 @@ export const debug_server = (
     logger: Logger,
     sessions: Map<string, MiniAppSession>,
     pendingSpawns: Map<string, PendingSpawn>,
-    fridaServer: Pick<FridaServerHandle, "claimMiniAppWindow">,
+    fridaServer: Pick<
+        FridaServerHandle,
+        | "listMiniAppWindowCandidates"
+        | "getMiniAppWindowCursor"
+        | "getStatus"
+    >,
 ) => {
     const debugSocketSessions = new Map<WebSocket, MiniAppSession>();
     const foregroundKeepAliveActive = new WeakSet<MiniAppSession>();
@@ -95,25 +159,56 @@ export const debug_server = (
                 session.appService !== undefined,
         );
 
-    const findPendingSpawnHint = () => {
-        const pendingSpawnList = Array.from(pendingSpawns.values()).sort(
-            (left, right) => left.createdAt - right.createdAt,
-        );
+    const diagnosticSession = (session: MiniAppSession) => ({
+        traceId: session.traceId,
+        sessionId: session.id,
+        requestedAppId: session.requestedAppId ?? null,
+        state: session.state,
+        launchId: session.launchId ?? null,
+        launchStartedAt:
+            session.launchStartedAt === undefined
+                ? null
+                : new Date(session.launchStartedAt).toISOString(),
+        launchWindowCursor: session.launchWindowCursor ?? null,
+        launchAppIdConfirmed: session.launchAppIdConfirmed ?? false,
+        transportPid: session.transportPid ?? null,
+        hwnd:
+            session.windowHandle === undefined
+                ? null
+                : `0x${session.windowHandle.toString(16)}`,
+        identityVerified: session.windowIdentity !== undefined,
+        debugSocketState: session.debugSocket?.readyState ?? null,
+    });
+
+    const findAvailablePendingSpawn = () => {
+        const pendingSpawnList = Array.from(pendingSpawns.values())
+            .filter((pendingSpawn) => pendingSpawn.boundSessionId === undefined)
+            .sort((left, right) => left.createdAt - right.createdAt);
         return pendingSpawnList.length === 1 ? pendingSpawnList[0] : undefined;
     };
 
-    const applyPendingSpawnHint = (session: MiniAppSession) => {
-        const pendingSpawn = findPendingSpawnHint();
-        if (!pendingSpawn) {
-            return;
-        }
-
+    const bindPendingSpawn = (
+        session: MiniAppSession,
+        pendingSpawn: PendingSpawn,
+        evidence: "appid" | "window",
+    ) => {
         session.requestedAppId = pendingSpawn.appid;
+        session.launchId = pendingSpawn.id;
         session.launchStartedAt = pendingSpawn.createdAt;
+        session.launchWindowCursor = pendingSpawn.windowCursor;
+        session.launchAppIdConfirmed = false;
+        pendingSpawn.boundSessionId = session.id;
         session.title = pendingSpawn.appid;
         logger.info(
-            `[miniapp] linked pending spawn ${pendingSpawn.appid} to ${session.id}`,
+            `[miniapp] bound pending spawn ${pendingSpawn.appid} to ${session.id}`,
         );
+        emitMiniAppDiagnostic(logger, "launch_bound", {
+            ...diagnosticSession(session),
+            evidence,
+            launchId: pendingSpawn.id,
+            appid: pendingSpawn.appid,
+            windowCursor: pendingSpawn.windowCursor,
+        });
     };
 
     const resolvePendingSpawn = (appid: string, session: MiniAppSession) => {
@@ -121,9 +216,20 @@ export const debug_server = (
         if (!pendingSpawn) {
             return;
         }
+        if (session.launchId !== pendingSpawn.id) {
+            logger.info(
+                `[miniapp] refusing to resolve pending spawn ${appid} from unrelated session ${session.id}`,
+            );
+            return;
+        }
 
         clearTimeout(pendingSpawn.timeout);
         pendingSpawns.delete(appid);
+        emitMiniAppDiagnostic(logger, "launch_ready", {
+            ...diagnosticSession(session),
+            launchId: pendingSpawn.id,
+            appid,
+        });
         for (const waiter of pendingSpawn.waiters) {
             waiter.resolve(session);
         }
@@ -138,6 +244,13 @@ export const debug_server = (
 
         clearTimeout(pendingSpawn.timeout);
         pendingSpawns.delete(appid);
+        emitMiniAppDiagnostic(logger, "launch_rejected", {
+            source: "debug-server",
+            launchId: pendingSpawn.id,
+            appid,
+            boundSessionId: pendingSpawn.boundSessionId ?? null,
+            reason: error.message,
+        });
         for (const waiter of pendingSpawn.waiters) {
             waiter.reject(error);
         }
@@ -148,8 +261,11 @@ export const debug_server = (
         session: MiniAppSession,
         error: Error,
     ) => {
-        if (session.requestedAppId) {
-            rejectPendingSpawn(session.requestedAppId, error);
+        const pendingSpawn = session.requestedAppId
+            ? pendingSpawns.get(session.requestedAppId)
+            : undefined;
+        if (pendingSpawn && pendingSpawn.id === session.launchId) {
+            rejectPendingSpawn(pendingSpawn.appid, error);
         }
     };
 
@@ -244,57 +360,356 @@ export const debug_server = (
         closeWebSocket(debugSocket, 1011, reason, true);
     };
 
-    const rememberMiniAppWindow = (
-        session: MiniAppSession,
-        options?: { fallbackToLatest?: boolean },
-    ) => {
-        if (session.windowHandle !== undefined) {
-            return session.windowHandle;
-        }
-
-        try {
-            const claimBaseline = session.launchStartedAt ?? session.createdAt;
-            const miniAppWindow = fridaServer.claimMiniAppWindow({
-                createdAfter: claimBaseline,
-                graceMs: MINIAPP_WINDOW_CLAIM_GRACE_MS,
-                fallbackToLatest: options?.fallbackToLatest ?? false,
-            });
-            if (miniAppWindow !== undefined) {
-                session.windowHandle = miniAppWindow.handle;
-                logger.info(
-                    `[miniapp] remembered window hwnd for ${session.id}: 0x${miniAppWindow.handle.toString(16)}`,
-                );
-            }
-        } catch (error) {
-            logger.error(
-                `[miniapp] failed to remember window hwnd for ${session.id}:`,
-                error,
-            );
-        }
-
-        return session.windowHandle;
-    };
-
     const sleep = (ms: number) =>
         new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-    const waitForMiniAppWindow = async (session: MiniAppSession) => {
-        const deadline = Date.now() + MINIAPP_WINDOW_WAIT_MS;
-        while (Date.now() < deadline) {
-            const windowHandle = rememberMiniAppWindow(session);
-            if (windowHandle !== undefined) {
-                return windowHandle;
-            }
-            if (
-                !session.debugSocket ||
-                session.debugSocket.readyState !== WebSocket.OPEN
-            ) {
-                return undefined;
-            }
-            await sleep(MINIAPP_WINDOW_WAIT_INTERVAL_MS);
+    const classifyWindowCandidates = (breakdown: {
+        afterCursor: number;
+        withinTimeWindow: number;
+        transportPidMatches: number;
+        enumeratedWindows: number;
+        eligible: number;
+    }) => {
+        if (breakdown.afterCursor === 0) return "create_event_absent";
+        if (breakdown.withinTimeWindow === 0)
+            return "create_event_outside_launch_window";
+        if (breakdown.transportPidMatches === 0)
+            return "create_event_pid_mismatch";
+        if (breakdown.eligible === 0) return "candidate_not_enumerated";
+        if (breakdown.eligible > 1) return "multiple_exact_candidates";
+        return "unique_exact_candidate";
+    };
+
+    const verifyWindowIdentityFromDiagnostic = (
+        session: MiniAppSession,
+        diagnostic: Awaited<
+            ReturnType<typeof diagnoseWin32WindowIdentity>
+        >,
+        fridaAttachedPid: number | null,
+    ) => {
+        const missing: string[] = [];
+        if (!session.launchId) missing.push("launch_id_missing");
+        if (session.launchStartedAt === undefined)
+            missing.push("launch_start_missing");
+        if (session.launchWindowCursor === undefined)
+            missing.push("window_cursor_missing");
+        if (diagnostic.transportPid === null)
+            missing.push("transport_pid_unresolved");
+        if (diagnostic.transportProcessStartTime === null)
+            missing.push("transport_start_time_unresolved");
+        if (fridaAttachedPid === null) missing.push("frida_pid_unresolved");
+        if (
+            fridaAttachedPid !== null &&
+            diagnostic.transportPid !== null &&
+            fridaAttachedPid !== diagnostic.transportPid
+        ) {
+            missing.push("frida_transport_pid_mismatch");
+        }
+        if (missing.length > 0) {
+            emitMiniAppDiagnostic(logger, "hwnd_proof_skipped", {
+                ...diagnosticSession(session),
+                reasons: missing,
+                fridaPid: fridaAttachedPid,
+                transportPid: diagnostic.transportPid,
+            });
+            return;
         }
 
-        return rememberMiniAppWindow(session, { fallbackToLatest: true });
+        const { candidates, eligible, breakdown } = findEligibleWindowCandidates(
+            diagnostic,
+            session.launchWindowCursor!,
+            session.launchStartedAt!,
+        );
+        emitMiniAppDiagnostic(logger, "hwnd_candidates_evaluated", {
+            ...diagnosticSession(session),
+            reason: classifyWindowCandidates(breakdown),
+            candidateCount: candidates.length,
+            eligibleCount: eligible.length,
+            breakdown,
+            candidates: candidates.slice(0, 10).map((candidate) => ({
+                sequence: candidate.sequence,
+                hwnd: `0x${candidate.handle.toString(16)}`,
+                pid: candidate.pid ?? null,
+                tid: candidate.threadId ?? null,
+                className: candidate.className ?? null,
+                observedAt: new Date(candidate.createdAt).toISOString(),
+            })),
+            enumeratedWindowCount: diagnostic.windows.length,
+            fridaPid: fridaAttachedPid,
+            transportPid: diagnostic.transportPid,
+        });
+        if (eligible.length !== 1) {
+            if (candidates.length > 0) {
+                logger.info(
+                    `[miniapp] HWND identity remains ambiguous for ${session.id}: ` +
+                        `${candidates.length} launch-window candidates, ${eligible.length} exact socket/PID matches`,
+                );
+            }
+            return;
+        }
+
+        const { candidate, window, expectedHwnd } = eligible[0];
+        session.windowHandle = candidate.handle;
+        session.windowIdentity = {
+            handle: candidate.handle,
+            pid: window.pid,
+            tid: window.tid,
+            className: window.className,
+            owner: window.owner,
+            root: window.root,
+            rootOwner: window.rootOwner,
+            launchId: session.launchId!,
+            fridaObservedAt: candidate.createdAt,
+            processStartTime: diagnostic.transportProcessStartTime!,
+            appIdConfirmed: session.launchAppIdConfirmed === true,
+            verifiedAt: Date.now(),
+        };
+        logger.info(
+            `[miniapp] verified HWND identity for ${session.id}: ${expectedHwnd} ` +
+                `(pid=${window.pid}, tid=${window.tid}, class=${window.className})`,
+        );
+        emitMiniAppDiagnostic(logger, "hwnd_proof_verified", {
+            ...diagnosticSession(session),
+            hwnd: expectedHwnd,
+            pid: window.pid,
+            tid: window.tid,
+            className: window.className,
+            processStartTime: diagnostic.transportProcessStartTime,
+            appIdConfirmed: session.windowIdentity!.appIdConfirmed,
+        });
+    };
+
+    const findEligibleWindowCandidates = (
+        diagnostic: Awaited<
+            ReturnType<typeof diagnoseWin32WindowIdentity>
+        >,
+        windowCursor: number,
+        launchStartedAt: number,
+    ) => {
+        const observedBefore = Date.parse(diagnostic.observedAt);
+        const afterCursor = fridaServer.listMiniAppWindowCandidates({
+            afterSequence: windowCursor,
+        });
+        const withinTimeWindow = afterCursor.filter(
+            (candidate) =>
+                candidate.createdAt >= launchStartedAt &&
+                (!Number.isFinite(observedBefore) ||
+                    candidate.createdAt <= observedBefore),
+        );
+        const candidates = withinTimeWindow.filter(
+            (candidate) => candidate.pid === diagnostic.transportPid,
+        );
+        const eligible = candidates.flatMap((candidate) => {
+            if (candidate.threadId === undefined) {
+                return [];
+            }
+            const expectedHwnd = `0x${candidate.handle.toString(16)}`;
+            const matches = diagnostic.windows.filter(
+                (window) =>
+                    window.hwnd.toLowerCase() === expectedHwnd &&
+                    window.pid === diagnostic.transportPid &&
+                    window.tid === candidate.threadId,
+            );
+            return matches.length === 1
+                ? [{ candidate, window: matches[0], expectedHwnd }]
+                : [];
+        });
+        return {
+            candidates,
+            eligible,
+            breakdown: {
+                afterCursor: afterCursor.length,
+                withinTimeWindow: withinTimeWindow.length,
+                transportPidMatches: candidates.length,
+                enumeratedWindows: diagnostic.windows.length,
+                eligible: eligible.length,
+            },
+        };
+    };
+
+    const bindPendingSpawnFromWindowEvidence = (
+        session: MiniAppSession,
+        diagnostic: Awaited<
+            ReturnType<typeof diagnoseWin32WindowIdentity>
+        >,
+        fridaAttachedPid: number | null,
+    ) => {
+        if (session.launchId) {
+            return;
+        }
+        const reasons: string[] = [];
+        if (session.state !== "closing")
+            reasons.push("bootstrap_not_failed");
+        if (session.requestedAppId !== undefined)
+            reasons.push("session_already_has_appid");
+        if (!session.lastError?.includes("did not return a valid appid"))
+            reasons.push("failure_is_not_blank_appid");
+        if (diagnostic.transportPid === null)
+            reasons.push("transport_pid_unresolved");
+        if (fridaAttachedPid === null) reasons.push("frida_pid_unresolved");
+        if (
+            fridaAttachedPid !== null &&
+            diagnostic.transportPid !== null &&
+            fridaAttachedPid !== diagnostic.transportPid
+        ) {
+            reasons.push("frida_transport_pid_mismatch");
+        }
+        if (reasons.length > 0) {
+            emitMiniAppDiagnostic(logger, "launch_window_bind_skipped", {
+                ...diagnosticSession(session),
+                reasons,
+                fridaPid: fridaAttachedPid,
+                transportPid: diagnostic.transportPid,
+            });
+            return;
+        }
+        const pendingSpawn = findAvailablePendingSpawn();
+        if (!pendingSpawn) {
+            emitMiniAppDiagnostic(logger, "launch_window_bind_skipped", {
+                reasons: ["no_single_unbound_pending_launch"],
+                pendingLaunchCount: pendingSpawns.size,
+                ...diagnosticSession(session),
+            });
+            return;
+        }
+        const { candidates, eligible, breakdown } =
+            findEligibleWindowCandidates(
+            diagnostic,
+            pendingSpawn.windowCursor,
+            pendingSpawn.createdAt,
+        );
+        if (eligible.length === 1) {
+            bindPendingSpawn(session, pendingSpawn, "window");
+        } else {
+            emitMiniAppDiagnostic(logger, "launch_window_bind_skipped", {
+                ...diagnosticSession(session),
+                reasons: [classifyWindowCandidates(breakdown)],
+                launchId: pendingSpawn.id,
+                appid: pendingSpawn.appid,
+                candidateCount: candidates.length,
+                eligibleCount: eligible.length,
+                breakdown,
+                fridaPid: fridaAttachedPid,
+                transportPid: diagnostic.transportPid,
+            });
+        }
+    };
+
+    const logWindowIdentityDiagnostic = async (
+        session: MiniAppSession,
+        socket: {
+            localAddress?: string;
+            localPort?: number;
+            remoteAddress?: string;
+            remotePort?: number;
+        },
+        phase: "socket-connected" | "bootstrap-settled",
+    ) => {
+        try {
+            const diagnostic = await diagnoseWin32WindowIdentity(socket);
+            const fridaAttachedPid = fridaServer.getStatus().pid;
+            if (diagnostic.transportPid !== null) {
+                session.transportPid = diagnostic.transportPid;
+                touchSession(session);
+            }
+            bindPendingSpawnFromWindowEvidence(
+                session,
+                diagnostic,
+                fridaAttachedPid,
+            );
+            verifyWindowIdentityFromDiagnostic(
+                session,
+                diagnostic,
+                fridaAttachedPid,
+            );
+            emitMiniAppDiagnostic(logger, "identity_probe", {
+                ...diagnosticSession(session),
+                phase,
+                reasonCodes: [
+                    diagnostic.tcp.serverMatchCount === 0
+                        ? "tcp_server_row_unresolved"
+                        : diagnostic.tcp.serverMatchCount > 1
+                          ? "tcp_server_row_ambiguous"
+                          : null,
+                    diagnostic.tcp.serverMatchCount === 1 &&
+                    diagnostic.tcp.reverseMatchCount === 0
+                        ? "tcp_reverse_row_unresolved"
+                        : diagnostic.tcp.serverMatchCount === 1 &&
+                            diagnostic.tcp.reverseMatchCount > 1
+                          ? "tcp_reverse_row_ambiguous"
+                          : diagnostic.tcp.serverMatchCount !== 1
+                            ? "tcp_reverse_lookup_not_attempted"
+                          : null,
+                    fridaAttachedPid === null
+                        ? "frida_pid_unresolved"
+                        : null,
+                    fridaAttachedPid !== null &&
+                    diagnostic.transportPid !== null &&
+                    fridaAttachedPid !== diagnostic.transportPid
+                        ? "frida_transport_pid_mismatch"
+                        : null,
+                ].filter((reason): reason is string => reason !== null),
+                endpoint: describeSocketEndpoint(diagnostic.endpoint),
+                frida: {
+                    pid: fridaAttachedPid,
+                    phase: fridaServer.getStatus().phase,
+                    hookInstalled: fridaServer.getStatus().hookInstalled,
+                },
+                transportPid: diagnostic.transportPid,
+                transportProcessStartTime:
+                    diagnostic.transportProcessStartTime,
+                tcp: {
+                    serverMatchCount: diagnostic.tcp.serverMatchCount,
+                    serverMatchesByFamily:
+                        diagnostic.tcp.serverMatchesByFamily,
+                    reverseMatchCount: diagnostic.tcp.reverseMatchCount,
+                    reverseMatchesByFamily:
+                        diagnostic.tcp.reverseMatchesByFamily,
+                    serverRow: describeTcpRow(diagnostic.tcp.serverRow),
+                    reverseRow: describeTcpRow(diagnostic.tcp.reverseRow),
+                },
+                windows: diagnostic.windows.slice(0, 20).map((window) => ({
+                    hwnd: window.hwnd,
+                    pid: window.pid,
+                    tid: window.tid,
+                    className: window.className,
+                    visible: window.visible,
+                    iconic: window.iconic,
+                    style: window.style,
+                    exStyle: window.exStyle,
+                    owner: window.owner,
+                    root: window.root,
+                    rootOwner: window.rootOwner,
+                    rect: window.rect,
+                })),
+                errors: diagnostic.errors,
+            });
+            logger.info(
+                `[miniapp] read-only window identity diagnostic (${phase}, ${session.id}): ` +
+                    `fridaPid=${fridaAttachedPid ?? "none"}, ` +
+                    `transportPid=${diagnostic.transportPid ?? "none"}, ` +
+                    `windows=${diagnostic.windows.length}, ` +
+                    `errors=${diagnostic.errors.length}`,
+            );
+        } catch (error) {
+            const fridaStatus = fridaServer.getStatus();
+            emitMiniAppDiagnostic(logger, "identity_probe_failed", {
+                phase,
+                error,
+                endpoint: describeSocketEndpoint(socket),
+                frida: {
+                    pid: fridaStatus.pid,
+                    phase: fridaStatus.phase,
+                    hookInstalled: fridaStatus.hookInstalled,
+                    targetSelection: fridaStatus.targetSelection,
+                },
+                ...diagnosticSession(session),
+            });
+            logger.error(
+                `[miniapp] read-only window identity diagnostic failed (${phase}, ${session.id}):`,
+                error,
+            );
+        }
     };
 
     const sendMiniAppCdpMessage = (session: MiniAppSession, message: string) => {
@@ -612,16 +1027,27 @@ export const debug_server = (
             },
             appContext.sessionId,
         );
-        logger.info(
-            "[miniapp] account info:",
-            accountInfoResponse.result?.result?.value ?? null,
-        );
         const accountInfoValue = accountInfoResponse.result?.result?.value;
         const appId = accountInfoValue?.miniProgram?.appId;
         const appidValue =
             typeof appId === "string" && appId.trim().length > 0
                 ? appId.trim()
                 : "";
+        emitMiniAppDiagnostic(logger, "appid_observed", {
+            resolvedAppId: appidValue || null,
+            status: appidValue ? "valid" : "blank",
+            envVersion:
+                accountInfoValue?.miniProgram?.envVersion ?? null,
+            version: accountInfoValue?.miniProgram?.version ?? null,
+            runtimeError: accountInfoValue?.__error ?? null,
+            ...diagnosticSession(session),
+        });
+        logger.info(
+            `[miniapp] account info for ${session.id}: ` +
+                `appid=${appidValue || "<blank>"}, ` +
+                `env=${accountInfoValue?.miniProgram?.envVersion ?? "unknown"}, ` +
+                `version=${accountInfoValue?.miniProgram?.version ?? "unknown"}`,
+        );
         if (!appidValue) {
             throw new Error(
                 "miniapp did not return a valid appid; runtime is not running correctly",
@@ -684,7 +1110,7 @@ export const debug_server = (
             if (!sessions.has(appid)) {
                 sessions.set(appid, session);
             }
-            return;
+            return true;
         }
 
         const existing = sessions.get(appid);
@@ -692,39 +1118,113 @@ export const debug_server = (
             logger.error(
                 `[miniapp] duplicate live session for ${appid}: ${existing.id} and ${session.id}`,
             );
-            return;
+            return false;
         }
 
         const previousId = session.id;
         sessions.delete(previousId);
         session.id = appid;
         sessions.set(appid, session);
+        return true;
     };
 
     const bootstrapSession = async (session: MiniAppSession) => {
+        const bootstrapStartedAt = Date.now();
+        emitMiniAppDiagnostic(logger, "bootstrap_started", {
+            ...diagnosticSession(session),
+        });
         try {
             const appid = await resolveSessionAppId(session);
+            if (session.closeInProgress) {
+                throw new Error("bootstrap cancelled by explicit close");
+            }
+            if (!session.launchId) {
+                const matchingPendingSpawn = pendingSpawns.get(appid);
+                if (
+                    matchingPendingSpawn &&
+                    matchingPendingSpawn.boundSessionId === undefined
+                ) {
+                    bindPendingSpawn(session, matchingPendingSpawn, "appid");
+                }
+            }
+            const expectedAppId = session.requestedAppId;
+            const launchMismatch =
+                expectedAppId !== undefined && expectedAppId !== appid;
+            if (launchMismatch) {
+                const mismatchMessage =
+                    `pending launch expected ${expectedAppId}, but the socket resolved to ${appid}`;
+                rejectPendingSpawn(expectedAppId, new Error(mismatchMessage));
+                session.windowHandle = undefined;
+                session.windowIdentity = undefined;
+                session.launchId = undefined;
+                session.launchStartedAt = undefined;
+                session.launchWindowCursor = undefined;
+                session.launchAppIdConfirmed = false;
+                logger.error(`[miniapp] ${mismatchMessage}; HWND candidate discarded`);
+                emitMiniAppDiagnostic(logger, "appid_mismatch", {
+                    expectedAppId,
+                    resolvedAppId: appid,
+                    ...diagnosticSession(session),
+                });
+            }
             if (appid) {
                 session.title = appid;
                 session.requestedAppId = appid;
-                rekeySessionByAppId(session, appid);
+                if (!rekeySessionByAppId(session, appid)) {
+                    throw new Error(
+                        `duplicate live session for ${appid}; refusing to publish the duplicate`,
+                    );
+                }
+            }
+            if (!launchMismatch) {
+                session.launchAppIdConfirmed = true;
+                if (session.windowIdentity) {
+                    session.windowIdentity.appIdConfirmed = true;
+                }
             }
             session.state = "ready";
             session.lastError = undefined;
             startForegroundKeepAlive(session);
             touchSession(session);
-            if (appid) {
+            if (appid && !launchMismatch) {
                 resolvePendingSpawn(appid, session);
             }
             logger.info(`[miniapp] miniapp ready: ${session.id}`);
+            emitMiniAppDiagnostic(logger, "bootstrap_ready", {
+                resolvedAppId: appid,
+                durationMs: Date.now() - bootstrapStartedAt,
+                ...diagnosticSession(session),
+            });
         } catch (error) {
             const errorMessage = formatErrorMessage(error);
             const closeMessage = `miniapp bootstrap failed: ${errorMessage}`;
+            if (session.closeInProgress) {
+                rejectSessionPendingSpawn(session, new Error(closeMessage));
+                logger.info(
+                    `[miniapp] bootstrap stopped for ${session.id} because explicit close is in progress`,
+                );
+                emitMiniAppDiagnostic(logger, "bootstrap_cancelled", {
+                    durationMs: Date.now() - bootstrapStartedAt,
+                    error,
+                    ...diagnosticSession(session),
+                });
+                return;
+            }
+            session.state = "closing";
             session.lastError = closeMessage;
             touchSession(session);
+            stopForegroundKeepAlive(session);
             logger.error(`[miniapp] bootstrap failed for ${session.id}:`, error);
+            emitMiniAppDiagnostic(logger, "bootstrap_failed", {
+                durationMs: Date.now() - bootstrapStartedAt,
+                error,
+                automaticCloseSkipped: true,
+                ...diagnosticSession(session),
+            });
             rejectSessionPendingSpawn(session, new Error(closeMessage));
-            await killMiniApp(session, closeMessage);
+            logger.info(
+                `[miniapp] automatic close skipped for ${session.id}; use the explicit despawn endpoint if closure is required`,
+            );
         }
     };
 
@@ -817,95 +1317,291 @@ export const debug_server = (
         }
     };
 
-    const waitForMiniAppClose = (session: MiniAppSession) =>
-        new Promise<void>((resolve, reject) => {
-            if (!session.debugSocket) {
-                resolve();
-                return;
-            }
-
-            const timeout = setTimeout(() => {
-                session.closeWaiters.delete(waiter);
-                reject(new Error("miniapp close timeout"));
-            }, INTERNAL_CDP_TIMEOUT_MS);
-            const waiter: CloseWaiter = {
-                resolve: () => {
-                    resolve();
+    const validateWindowForClose = (
+        session: MiniAppSession,
+        allowLaunchCorrelated: boolean,
+    ) => {
+        const identity = session.windowIdentity;
+        if (!identity || identity.launchId !== session.launchId) {
+            emitMiniAppDiagnostic(logger, "close_revalidation", {
+                outcome: "rejected",
+                reason: "close_identity_missing",
+                allowLaunchCorrelated,
+                ...diagnosticSession(session),
+            });
+            throw new Error(
+                "miniapp window identity unavailable; refusing to close an unverified window",
+            );
+        }
+        if (!identity.appIdConfirmed && !allowLaunchCorrelated) {
+            emitMiniAppDiagnostic(logger, "close_revalidation", {
+                outcome: "rejected",
+                reason: "close_appid_unconfirmed",
+                expected: {
+                    hwnd: `0x${identity.handle.toString(16)}`,
+                    pid: identity.pid,
+                    tid: identity.tid,
+                    className: identity.className,
                 },
-                timeout,
-            };
-            session.closeWaiters.add(waiter);
+                allowLaunchCorrelated,
+                ...diagnosticSession(session),
+            });
+            throw new Error(
+                "miniapp appid was not confirmed; retry explicit despawn with allowLaunchCorrelated=true to close the launch-correlated HWND",
+            );
+        }
+
+        const inspection = inspectWin32WindowIdentity(
+            identity.handle,
+            identity.pid,
+        );
+        if (!inspection.windowCheckCompleted) {
+            emitMiniAppDiagnostic(logger, "close_revalidation", {
+                outcome: "rejected",
+                reason: "close_inspection_failed",
+                errors: inspection.errors,
+                ...diagnosticSession(session),
+            });
+            throw new Error(
+                `miniapp window revalidation failed: ${inspection.errors.join("; ") || "unknown Win32 error"}`,
+            );
+        }
+        if (!inspection.windowExists) {
+            if (
+                session.debugSocket &&
+                session.debugSocket.readyState === WebSocket.OPEN
+            ) {
+                emitMiniAppDiagnostic(logger, "close_revalidation", {
+                    outcome: "rejected",
+                    reason: "close_hwnd_gone_socket_connected",
+                    inspection,
+                    ...diagnosticSession(session),
+                });
+                throw new Error(
+                    "verified miniapp HWND disappeared while its runtime socket is still connected; refusing detach-only cleanup",
+                );
+            }
+            emitMiniAppDiagnostic(logger, "close_revalidation", {
+                outcome: "already_gone",
+                reason: "close_hwnd_already_gone",
+                inspection,
+                ...diagnosticSession(session),
+            });
+            return { identity, alreadyGone: true } as const;
+        }
+        const window = inspection.snapshot;
+        const sameHandle = `0x${identity.handle.toString(16)}`;
+        const mismatchFields = !window
+            ? ["snapshot"]
+            : [
+                  inspection.processStartTime !== identity.processStartTime
+                      ? "processStartTime"
+                      : null,
+                  window.hwnd.toLowerCase() !== sameHandle ? "hwnd" : null,
+                  window.pid !== identity.pid ? "pid" : null,
+                  window.tid !== identity.tid ? "tid" : null,
+                  window.className !== identity.className
+                      ? "className"
+                      : null,
+                  window.owner !== identity.owner ? "owner" : null,
+                  window.root !== identity.root ? "root" : null,
+                  window.rootOwner !== identity.rootOwner
+                      ? "rootOwner"
+                      : null,
+              ].filter((field): field is string => field !== null);
+        if (mismatchFields.length > 0) {
+            emitMiniAppDiagnostic(logger, "close_revalidation", {
+                outcome: "rejected",
+                reason: "close_identity_changed",
+                mismatchFields,
+                expected: {
+                    hwnd: sameHandle,
+                    pid: identity.pid,
+                    tid: identity.tid,
+                    className: identity.className,
+                    owner: identity.owner,
+                    root: identity.root,
+                    rootOwner: identity.rootOwner,
+                    processStartTime: identity.processStartTime,
+                },
+                actual: window
+                    ? {
+                          hwnd: window.hwnd,
+                          pid: window.pid,
+                          tid: window.tid,
+                          className: window.className,
+                          owner: window.owner,
+                          root: window.root,
+                          rootOwner: window.rootOwner,
+                          processStartTime: inspection.processStartTime,
+                      }
+                    : null,
+                errors: inspection.errors,
+                ...diagnosticSession(session),
+            });
+            throw new Error(
+                "miniapp window identity changed; refusing to close a recycled or unrelated HWND",
+            );
+        }
+
+        emitMiniAppDiagnostic(logger, "close_revalidation", {
+            ...diagnosticSession(session),
+            outcome: "verified",
+            reason: "close_identity_verified",
+            hwnd: sameHandle,
+            pid: identity.pid,
+            tid: identity.tid,
+            appIdConfirmed: identity.appIdConfirmed,
+            allowLaunchCorrelated,
         });
 
-    const closeMiniApp = async (session: MiniAppSession) => {
-        if (!session.debugSocket) {
-            throw new Error("miniapp debug socket unavailable for close");
-        }
-
-        const windowHandle = await waitForMiniAppWindow(session);
-        if (windowHandle === undefined) {
-            throw new Error("miniapp window handle unavailable for close");
-        }
-
-        const closePromise = waitForMiniAppClose(session);
-        try {
-            close_window(windowHandle);
-        } catch (error) {
-            if (!session.debugSocket) {
-                await closePromise.catch(() => undefined);
-                return;
-            }
-            closePromise.catch(() => undefined);
-            throw error;
-        }
-        await closePromise;
+        return { identity, alreadyGone: false } as const;
     };
 
-    const killMiniApp = async (session: MiniAppSession, reason: string) => {
-        session.state = "closing";
-        session.lastError = reason;
-        touchSession(session);
-        stopForegroundKeepAlive(session);
-
-        if (!session.debugSocket) {
-            detachSession(session, reason);
-            logger.info(
-                `[miniapp] miniapp session detached after debug socket closed: ${session.id}`,
-            );
-            return {
-                closed: false,
-                forced: true,
-            };
+    const closeVerifiedWindow = async (
+        session: MiniAppSession,
+        identity: MiniAppSession["windowIdentity"] & {},
+    ) => {
+        const closeStartedAt = Date.now();
+        try {
+            close_window(identity.handle, {
+                pid: identity.pid,
+                tid: identity.tid,
+            });
+            emitMiniAppDiagnostic(logger, "close_dispatch", {
+                ...diagnosticSession(session),
+                outcome: "posted",
+                hwnd: `0x${identity.handle.toString(16)}`,
+                pid: identity.pid,
+                tid: identity.tid,
+            });
+        } catch (error) {
+            emitMiniAppDiagnostic(logger, "close_dispatch", {
+                ...diagnosticSession(session),
+                outcome: "post_failed",
+                hwnd: `0x${identity.handle.toString(16)}`,
+                error,
+            });
+            throw error;
+        }
+        const deadline = Date.now() + INTERNAL_CDP_TIMEOUT_MS;
+        while (Date.now() < deadline) {
+            if (!is_window(identity.handle)) {
+                emitMiniAppDiagnostic(logger, "close_dispatch", {
+                    ...diagnosticSession(session),
+                    outcome: "closed",
+                    hwnd: `0x${identity.handle.toString(16)}`,
+                    elapsedMs: Date.now() - closeStartedAt,
+                });
+                return;
+            }
+            await sleep(MINIAPP_WINDOW_WAIT_INTERVAL_MS);
         }
 
+        emitMiniAppDiagnostic(logger, "close_dispatch", {
+            ...diagnosticSession(session),
+            outcome: "timeout",
+            reason: "wm_close_timeout",
+            hwnd: `0x${identity.handle.toString(16)}`,
+            elapsedMs: Date.now() - closeStartedAt,
+        });
+
+        throw new Error(
+            `miniapp window did not close: 0x${identity.handle.toString(16)}`,
+        );
+    };
+
+    const killMiniApp = async (
+        session: MiniAppSession,
+        reason: string,
+        options: { allowLaunchCorrelated?: boolean } = {},
+    ) => {
+        const previousState = session.state;
+        const previousError = session.lastError;
+
         try {
-            await closeMiniApp(session);
+            const validated = validateWindowForClose(
+                session,
+                options.allowLaunchCorrelated === true,
+            );
+            if (validated.alreadyGone) {
+                detachSession(session, reason);
+                return {
+                    closed: false,
+                    alreadyGone: true,
+                    cleanupComplete: true,
+                    forced: false,
+                    launchCorrelatedClose:
+                        !validated.identity.appIdConfirmed,
+                    error: null,
+                };
+            }
+
+            session.closeInProgress = true;
+            session.state = "closing";
+            session.lastError = reason;
+            touchSession(session);
+            stopForegroundKeepAlive(session);
+            await closeVerifiedWindow(session, validated.identity);
+            detachSession(session, reason);
             return {
                 closed: true,
+                alreadyGone: false,
+                cleanupComplete: true,
                 forced: false,
+                launchCorrelatedClose:
+                    !validated.identity.appIdConfirmed,
+                error: null,
             };
         } catch (error) {
             logger.error(
                 `[miniapp] window close failed for ${session.id}; keeping session attached for retry:`,
                 error,
             );
-            session.lastError = `miniapp close failed: ${formatErrorMessage(error)}`;
+            session.closeInProgress = false;
+            if (previousState === "ready") {
+                session.state = previousState;
+                session.lastError = previousError;
+                startForegroundKeepAlive(session);
+            } else if (session.state !== "closing") {
+                session.state = previousState;
+                session.lastError = previousError;
+            }
             touchSession(session);
             return {
                 closed: false,
+                alreadyGone: false,
+                cleanupComplete: false,
                 forced: false,
+                launchCorrelatedClose: false,
+                error: `miniapp close failed: ${formatErrorMessage(error)}`,
             };
         }
     };
 
-    wss.on("connection", (ws: WebSocket) => {
+    wss.on("connection", (ws: WebSocket, request) => {
+        const socketEndpoint = {
+            localAddress: request.socket.localAddress,
+            localPort: request.socket.localPort,
+            remoteAddress: request.socket.remoteAddress,
+            remotePort: request.socket.remotePort,
+        };
         const session = createSession();
-        applyPendingSpawnHint(session);
         session.debugSocket = ws;
         sessions.set(session.id, session);
         debugSocketSessions.set(ws, session);
-        rememberMiniAppWindow(session);
         logger.info(`[miniapp] miniapp client connected: ${session.id}`);
+        emitMiniAppDiagnostic(logger, "socket_connected", {
+            endpoint: describeSocketEndpoint(socketEndpoint),
+            pendingLaunchCount: pendingSpawns.size,
+            frida: fridaServer.getStatus(),
+            ...diagnosticSession(session),
+        });
+        void logWindowIdentityDiagnostic(
+            session,
+            socketEndpoint,
+            "socket-connected",
+        );
 
         ws.on("message", (message) => {
             const currentSession = debugSocketSessions.get(ws);
@@ -924,11 +1620,27 @@ export const debug_server = (
                 logger.error(`[miniapp] miniapp client err:`, error);
             }
         });
-        ws.on("close", () => {
+        ws.on("close", (code, reason) => {
             const currentSession = debugSocketSessions.get(ws);
             if (!currentSession) {
                 return;
             }
+
+            const proofStage = currentSession.windowIdentity?.appIdConfirmed
+                ? "appid_confirmed"
+                : currentSession.windowIdentity
+                  ? "hwnd_verified"
+                  : currentSession.transportPid !== undefined
+                    ? "transport_identified"
+                    : "socket_only";
+            emitMiniAppDiagnostic(logger, "socket_disconnected", {
+                code,
+                reasonBytes: reason.byteLength,
+                connectedMs: Date.now() - currentSession.createdAt,
+                stateBefore: currentSession.state,
+                proofStage,
+                ...diagnosticSession(currentSession),
+            });
 
             currentSession.debugSocket = undefined;
             currentSession.appService = undefined;
@@ -946,19 +1658,45 @@ export const debug_server = (
             ) {
                 currentSession.devtoolsSocket.close();
             }
-            removeSession(currentSession);
+            let retainedForExplicitClose =
+                currentSession.launchStartedAt !== undefined;
+            if (currentSession.windowHandle !== undefined) {
+                try {
+                    retainedForExplicitClose ||=
+                        is_window(currentSession.windowHandle);
+                } catch (error) {
+                    logger.error(
+                        `[miniapp] failed to validate cached hwnd for ${currentSession.id}:`,
+                        error,
+                    );
+                }
+            }
+            if (!retainedForExplicitClose) {
+                removeSession(currentSession);
+            }
             debugSocketSessions.delete(ws);
             logger.info(
-                `[miniapp] miniapp client disconnected: ${currentSession.id}`,
+                retainedForExplicitClose
+                    ? `[miniapp] miniapp client disconnected: ${currentSession.id}; retaining cached hwnd for explicit close`
+                    : `[miniapp] miniapp client disconnected: ${currentSession.id}`,
             );
+            emitMiniAppDiagnostic(logger, "session_after_disconnect", {
+                retainedForExplicitClose,
+                ...diagnosticSession(currentSession),
+            });
         });
 
-        void bootstrapSession(session);
+        void bootstrapSession(session).finally(() =>
+            logWindowIdentityDiagnostic(
+                session,
+                socketEndpoint,
+                "bootstrap-settled",
+            ),
+        );
     });
 
     return {
         listDebuggableSessions,
-        closeMiniApp,
         killMiniApp,
         evaluateInAppContext,
         sendMiniAppCdpMessage,

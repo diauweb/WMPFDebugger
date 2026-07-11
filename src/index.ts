@@ -23,8 +23,22 @@ const main = async () => {
                 lastHookEventAt: null,
                 lastHookMessage: null,
                 lastError: "frida disabled",
+                targetSelection: null,
             }),
-            claimMiniAppWindow: () => undefined,
+            listMiniAppWindowCandidates: () => [],
+            getMiniAppWindowCursor: () => 0,
+            waitUntilReady: async () => ({
+                active: false,
+                phase: "waiting" as const,
+                pid: null,
+                version: null,
+                hookInstalled: false,
+                attachedAt: null,
+                lastHookEventAt: null,
+                lastHookMessage: null,
+                lastError: "frida disabled",
+                targetSelection: null,
+            }),
         }
         : (() => {
             const { start_frida_server } = require("./frida-server") as typeof import("./frida-server");

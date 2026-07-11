@@ -5,6 +5,8 @@ type WeChatWindow = "main" | "login" | "none";
 
 type WeChatStatus = {
     window: WeChatWindow;
+    messageResult?: string;
+    messageResultIsWindow?: boolean;
 };
 
 type WeChatWindowHandle = {
@@ -42,6 +44,10 @@ const user32 =
               IsWindow: {
                   args: ["u64"],
                   returns: "i32",
+              },
+              GetWindowThreadProcessId: {
+                  args: ["u64", "ptr"],
+                  returns: "u32",
               },
               PostMessageW: {
                   args: ["u64", "u32", "u64", "i64"],
@@ -112,12 +118,26 @@ const is_window = (handle: number | bigint) => {
     );
 };
 
-const close_window = (handle: number | bigint) => {
+const close_window = (
+    handle: number | bigint,
+    expectedIdentity?: { pid: number; tid: number },
+) => {
     ensureWindows();
 
     const normalizedHandle = toNativeHandle(handle);
     if (!is_window(normalizedHandle)) {
         throw new Error("window handle is unavailable");
+    }
+    if (expectedIdentity) {
+        const pid = new Uint32Array(1);
+        const tid = Number(
+            user32.symbols.GetWindowThreadProcessId(normalizedHandle, pid),
+        );
+        if (pid[0] !== expectedIdentity.pid || tid !== expectedIdentity.tid) {
+            throw new Error(
+                "window owner changed immediately before WM_CLOSE",
+            );
+        }
     }
 
     const posted = user32.symbols.PostMessageW(
@@ -185,7 +205,12 @@ const runBridge = async (
         throw new Error("WM_COPYDATA send failed or timed out");
     }
 
-    return { window: status.window };
+    const rawMessageResult = messageResult[0];
+    return {
+        window: status.window,
+        messageResult: `0x${rawMessageResult.toString(16)}`,
+        messageResultIsWindow: is_window(rawMessageResult),
+    };
 };
 
 const get_wechat_status = () => runBridge("status");

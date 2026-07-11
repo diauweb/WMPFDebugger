@@ -1,9 +1,14 @@
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
 import WebSocket, { WebSocketServer } from "ws";
 
 import { CliOptions } from "./cli";
 import { FridaServerHandle } from "./frida-server";
 import { Logger } from "./logger";
+import {
+    emitMiniAppDiagnostic,
+    getMiniAppDiagnosticBundle,
+} from "./miniapp-diagnostics";
 import { report_fatal_error } from "./process-guards";
 import { get_wechat_status, spawn_miniapp } from "./wechat-host";
 import {
@@ -51,6 +56,15 @@ export const proxy_server = (
         response.end(JSON.stringify(payload));
     };
 
+    const isLoopbackRequest = (request: IncomingMessage) => {
+        const address = request.socket.remoteAddress?.toLowerCase() ?? "";
+        return (
+            address === "::1" ||
+            address.startsWith("127.") ||
+            address.startsWith("::ffff:127.")
+        );
+    };
+
     const readJsonBody = async (request: IncomingMessage) => {
         const chunks: Buffer[] = [];
         for await (const chunk of request) {
@@ -92,6 +106,11 @@ export const proxy_server = (
         return session;
     };
 
+    const findOtherPendingSpawn = (appid: string) =>
+        Array.from(pendingSpawns.values()).find(
+            (pendingSpawn) => pendingSpawn.appid !== appid,
+        );
+
     const rejectPendingSpawn = (appid: string, error: Error) => {
         const pendingSpawn = pendingSpawns.get(appid);
         if (!pendingSpawn) {
@@ -100,6 +119,13 @@ export const proxy_server = (
 
         clearTimeout(pendingSpawn.timeout);
         pendingSpawns.delete(appid);
+        emitMiniAppDiagnostic(logger, "launch_rejected", {
+            source: "proxy-server",
+            launchId: pendingSpawn.id,
+            appid,
+            boundSessionId: pendingSpawn.boundSessionId ?? null,
+            reason: error.message,
+        });
         for (const waiter of pendingSpawn.waiters) {
             waiter.reject(error);
         }
@@ -119,12 +145,22 @@ export const proxy_server = (
             );
         }, PENDING_SPAWN_TIMEOUT_MS);
         const pendingSpawn = {
+            id: randomUUID(),
             appid,
             createdAt: Date.now(),
+            windowCursor: fridaServer.getMiniAppWindowCursor(),
             timeout,
             waiters: new Set<PendingSpawnWaiter>(),
         };
         pendingSpawns.set(appid, pendingSpawn);
+        emitMiniAppDiagnostic(logger, "launch_registered", {
+            launchId: pendingSpawn.id,
+            appid,
+            createdAt: new Date(pendingSpawn.createdAt).toISOString(),
+            windowCursor: pendingSpawn.windowCursor,
+            timeoutMs: PENDING_SPAWN_TIMEOUT_MS,
+            frida: fridaServer.getStatus(),
+        });
         return pendingSpawn;
     };
 
@@ -212,6 +248,42 @@ export const proxy_server = (
                 200,
                 listSessions().map((session) => serializeSession(options, session)),
             );
+            return;
+        }
+
+        if (
+            request.method === "GET" &&
+            requestUrl.pathname === "/api/diagnostics/miniapp"
+        ) {
+            response.setHeader("Cache-Control", "no-store");
+            if (!isLoopbackRequest(request)) {
+                sendJson(response, 403, {
+                    error: "miniapp diagnostics are only available from loopback",
+                });
+                return;
+            }
+            sendJson(response, 200, {
+                ...getMiniAppDiagnosticBundle(),
+                currentState: {
+                    frida: fridaServer.getStatus(),
+                    pendingLaunches: Array.from(pendingSpawns.values()).map(
+                        (pendingSpawn) => ({
+                            launchId: pendingSpawn.id,
+                            appid: pendingSpawn.appid,
+                            createdAt: new Date(
+                                pendingSpawn.createdAt,
+                            ).toISOString(),
+                            windowCursor: pendingSpawn.windowCursor,
+                            boundSessionId:
+                                pendingSpawn.boundSessionId ?? null,
+                            waiterCount: pendingSpawn.waiters.size,
+                        }),
+                    ),
+                    sessions: listSessions().map((session) =>
+                        serializeSession(options, session),
+                    ),
+                },
+            });
             return;
         }
 
@@ -327,7 +399,7 @@ export const proxy_server = (
                 return;
             }
 
-            if (pendingSpawns.has(appid) || existingSession) {
+            if (pendingSpawns.has(appid)) {
                 sendJson(response, 202, {
                     miniappId: existingSession?.id ?? appid,
                     appid,
@@ -336,11 +408,41 @@ export const proxy_server = (
                 return;
             }
 
-            registerPendingSpawn(appid);
+            const otherPendingSpawn = findOtherPendingSpawn(appid);
+            if (otherPendingSpawn) {
+                sendJson(response, 409, {
+                    error: "another miniapp launch is still pending",
+                    pendingAppId: otherPendingSpawn.appid,
+                });
+                return;
+            }
+
+            if (existingSession) {
+                sendJson(response, 409, {
+                    error: "existing failed miniapp requires explicit cleanup",
+                    miniappId: existingSession.id,
+                    cleanupRequired: true,
+                });
+                return;
+            }
+
+            const pendingSpawn = registerPendingSpawn(appid);
             try {
                 const status = await spawn_miniapp(appid);
+                emitMiniAppDiagnostic(logger, "launch_dispatched", {
+                    source: "create",
+                    launchId: pendingSpawn.id,
+                    appid,
+                    windowCursor: pendingSpawn.windowCursor,
+                    hostWindow: status.window,
+                    wndprocResult: status.messageResult ?? null,
+                    wndprocResultIsWindow:
+                        status.messageResultIsWindow ?? false,
+                });
                 logger.info(
-                    `[api] spawn requested: ${appid} via ${status.window}`,
+                    `[api] spawn requested: ${appid} via ${status.window}; ` +
+                        `wndprocResult=${status.messageResult ?? "unavailable"}, ` +
+                        `resultIsWindow=${status.messageResultIsWindow ?? false}`,
                 );
                 sendJson(response, 202, {
                     miniappId: appid,
@@ -348,6 +450,12 @@ export const proxy_server = (
                     attached: false,
                 });
             } catch (error) {
+                emitMiniAppDiagnostic(logger, "launch_dispatch_failed", {
+                    source: "create",
+                    launchId: pendingSpawn.id,
+                    appid,
+                    error,
+                });
                 rejectPendingSpawn(
                     appid,
                     new Error("failed to spawn miniapp"),
@@ -394,14 +502,54 @@ export const proxy_server = (
             ) {
                 const isAlreadyLaunching = pendingSpawns.has(appid);
 
+                if (session && !isAlreadyLaunching) {
+                    sendJson(response, 409, {
+                        error: "existing failed miniapp requires explicit cleanup",
+                        miniappId: session.id,
+                        cleanupRequired: true,
+                    });
+                    return;
+                }
+
                 if (!isAlreadyLaunching) {
-                    registerPendingSpawn(appid);
+                    const otherPendingSpawn = findOtherPendingSpawn(appid);
+                    if (otherPendingSpawn) {
+                        sendJson(response, 409, {
+                            error: "another miniapp launch is still pending",
+                            pendingAppId: otherPendingSpawn.appid,
+                        });
+                        return;
+                    }
+
+                    const pendingSpawn = registerPendingSpawn(appid);
                     try {
                         const status = await spawn_miniapp(appid);
+                        emitMiniAppDiagnostic(logger, "launch_dispatched", {
+                            source: "evaluate",
+                            launchId: pendingSpawn.id,
+                            appid,
+                            windowCursor: pendingSpawn.windowCursor,
+                            hostWindow: status.window,
+                            wndprocResult: status.messageResult ?? null,
+                            wndprocResultIsWindow:
+                                status.messageResultIsWindow ?? false,
+                        });
                         logger.info(
-                            `[api] spawn requested for evaluate: ${appid} via ${status.window}`,
+                            `[api] spawn requested for evaluate: ${appid} via ${status.window}; ` +
+                                `wndprocResult=${status.messageResult ?? "unavailable"}, ` +
+                                `resultIsWindow=${status.messageResultIsWindow ?? false}`,
                         );
                     } catch (error) {
+                        emitMiniAppDiagnostic(
+                            logger,
+                            "launch_dispatch_failed",
+                            {
+                                source: "evaluate",
+                                launchId: pendingSpawn.id,
+                                appid,
+                                error,
+                            },
+                        );
                         rejectPendingSpawn(
                             appid,
                             new Error("failed to spawn miniapp"),
@@ -420,24 +568,23 @@ export const proxy_server = (
                 try {
                     session = await waitForSessionReady(appid);
                 } catch (error) {
+                    emitMiniAppDiagnostic(logger, "launch_not_ready", {
+                        appid,
+                        launchId: pendingSpawns.get(appid)?.id ?? null,
+                        sessionId: findSession(appid)?.id ?? null,
+                        error,
+                    });
                     logger.error(
                         `[api] miniapp did not become ready for evaluate (${appid}):`,
                         error,
                     );
                     const failedSession = findSession(appid);
-                    let closeResult:
-                        | Awaited<ReturnType<typeof debugServer.killMiniApp>>
-                        | undefined;
-                    if (failedSession) {
-                        closeResult = await debugServer.killMiniApp(
-                            failedSession,
-                            "miniapp did not become ready for evaluate",
-                        );
-                    }
                     sendJson(response, 504, {
                         error: "miniapp did not become ready in time",
-                        miniappClosed: closeResult?.closed ?? false,
-                        forcedClose: closeResult?.forced ?? false,
+                        miniappId: failedSession?.id ?? appid,
+                        miniappClosed: false,
+                        forcedClose: false,
+                        cleanupRequired: failedSession !== undefined,
                     });
                     return;
                 }
@@ -454,14 +601,12 @@ export const proxy_server = (
                     `[api] appContext evaluate failed (${session.id}):`,
                     error,
                 );
-                const closeResult = await debugServer.killMiniApp(
-                    session,
-                    "appContext evaluate failed",
-                );
                 sendJson(response, 500, {
                     error: "failed to evaluate in appContext",
-                    miniappClosed: closeResult.closed,
-                    forcedClose: closeResult.forced,
+                    miniappId: session.id,
+                    miniappClosed: false,
+                    forcedClose: false,
+                    sessionRetained: true,
                 });
             }
             return;
@@ -495,23 +640,54 @@ export const proxy_server = (
                 return;
             }
 
-            if (session.requestedAppId) {
-                rejectPendingSpawn(
-                    session.requestedAppId,
-                    new Error("miniapp despawn requested"),
-                );
-            }
-
             try {
+                const allowLaunchCorrelated =
+                    requestUrl.searchParams.get("allowLaunchCorrelated") ===
+                    "true";
+                emitMiniAppDiagnostic(logger, "close_requested", {
+                    requestedId: sessionId,
+                    sessionId: session.id,
+                    requestedAppId: session.requestedAppId ?? null,
+                    state: session.state,
+                    launchId: session.launchId ?? null,
+                    transportPid: session.transportPid ?? null,
+                    hwnd:
+                        session.windowHandle === undefined
+                            ? null
+                            : `0x${session.windowHandle.toString(16)}`,
+                    identityVerified: session.windowIdentity !== undefined,
+                    appIdConfirmed:
+                        session.windowIdentity?.appIdConfirmed ?? false,
+                    allowLaunchCorrelated,
+                });
                 const closeResult = await debugServer.killMiniApp(
                     session,
                     "miniapp despawn requested",
+                    { allowLaunchCorrelated },
                 );
-                sendJson(response, 200, {
+                if (closeResult.cleanupComplete && session.requestedAppId) {
+                    rejectPendingSpawn(
+                        session.requestedAppId,
+                        new Error("miniapp despawn requested"),
+                    );
+                }
+                emitMiniAppDiagnostic(logger, "close_result", {
+                    requestedId: sessionId,
+                    sessionId: session.id,
+                    ...closeResult,
+                });
+                sendJson(response, closeResult.cleanupComplete ? 200 : 409, {
+                    ...(closeResult.error
+                        ? { error: closeResult.error }
+                        : {}),
                     miniappId: session.id,
                     attached: session.attached,
                     miniappClosed: closeResult.closed,
+                    alreadyGone: closeResult.alreadyGone,
+                    cleanupComplete: closeResult.cleanupComplete,
                     forcedClose: closeResult.forced,
+                    launchCorrelatedClose:
+                        closeResult.launchCorrelatedClose,
                 });
             } catch (error) {
                 logger.error(

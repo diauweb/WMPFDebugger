@@ -26,38 +26,79 @@ const patchWin32WindowRecorder = () => {
     const NULL_HWND = ptr("0");
     const currentPid = Process.id;
 
-    const emitRecordedWindow = (hwnd, apiName, parentHwnd) => {
+    const readWindowString = (value, wide) => {
+        if (!value || value.isNull()) {
+            return null;
+        }
+
+        const numericValue = value.toUInt32();
+        if (numericValue > 0 && numericValue <= 0xffff) {
+            return `#${numericValue}`;
+        }
+
+        try {
+            return wide ? value.readUtf16String() : value.readCString();
+        } catch (error) {
+            return "<unreadable>";
+        }
+    };
+
+    const emitRecordedWindow = (
+        event,
+        hwnd,
+        apiName,
+        parentHwnd,
+        details = {},
+    ) => {
         send({
             source: "win32-window-recorder",
-            event: "created",
+            event,
             api: apiName,
             hwnd: hwnd.toString(),
+            pid: currentPid,
             parentHwnd: parentHwnd.toString(),
+            ...details,
         });
     };
 
-    const attachCreateWindowHook = (targetPtr, apiName) => {
+    const attachCreateWindowHook = (targetPtr, apiName, wide) => {
         if (!targetPtr) {
             return;
         }
 
         Interceptor.attach(targetPtr, {
             onEnter(args) {
+                this.exStyle = args[0].toUInt32();
+                this.className = readWindowString(args[1], wide);
+                this.windowName = readWindowString(args[2], wide);
                 this.parentHwnd = args[8];
                 this.style = args[3].toUInt32();
+                this.threadId = Process.getCurrentThreadId();
             },
             onLeave(retval) {
                 if (retval.isNull() || (this.style & WS_CHILD) !== 0) {
                     return;
                 }
 
-                emitRecordedWindow(retval, apiName, this.parentHwnd);
+                emitRecordedWindow(
+                    "created",
+                    retval,
+                    apiName,
+                    this.parentHwnd,
+                    {
+                        threadId: this.threadId,
+                        className: this.className,
+                        windowName: this.windowName,
+                        style: `0x${this.style.toString(16)}`,
+                        exStyle: `0x${this.exStyle.toString(16)}`,
+                    },
+                );
             },
         });
     };
 
-    attachCreateWindowHook(createWindowExWPtr, "CreateWindowExW");
-    attachCreateWindowHook(createWindowExAPtr, "CreateWindowExA");
+    attachCreateWindowHook(createWindowExWPtr, "CreateWindowExW", true);
+    attachCreateWindowHook(createWindowExAPtr, "CreateWindowExA", false);
 
     if (enumWindowsPtr && getWindowThreadProcessIdPtr) {
         const enumWindows = new NativeFunction(enumWindowsPtr, "bool", [
@@ -72,9 +113,15 @@ const patchWin32WindowRecorder = () => {
         const enumProc = new NativeCallback(
             (hwnd) => {
                 const pidOut = Memory.alloc(4);
-                getWindowThreadProcessId(hwnd, pidOut);
+                const threadId = getWindowThreadProcessId(hwnd, pidOut);
                 if (pidOut.readU32() === currentPid) {
-                    emitRecordedWindow(hwnd, "EnumWindows", NULL_HWND);
+                    emitRecordedWindow(
+                        "observed",
+                        hwnd,
+                        "EnumWindows",
+                        NULL_HWND,
+                        { threadId },
+                    );
                 }
                 return true;
             },
