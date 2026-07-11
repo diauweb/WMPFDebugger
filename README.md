@@ -89,6 +89,29 @@ bun run src/index.ts
 
 **Step 4.** Open your chromium-based browsers, navigate to `devtools://devtools/bundled/inspector.html?ws=127.0.0.1:62000` and profit. You can change the CDP port `CDP_PORT` (62000 in this example) in `src/index.ts` to any port you like.
 
+## Miniapp lifecycle diagnostics
+
+The debugger keeps the latest 300 structured lifecycle records in memory and
+also prints each record as one line prefixed with `[miniapp-diag]`. The current
+Frida target-selection evidence is retained separately in the bundle even if
+its original record rolls out of that ring. The trace
+contains launch/session IDs, PID/TID/HWND correlation, candidate rejection
+reasons, bootstrap state, disconnect timing, and close revalidation outcomes.
+It omits raw CDP payloads, endpoint addresses, and window titles.
+
+After reproducing a launch or close failure, capture the complete pasteable
+bundle with:
+
+```bash
+node scripts/test-api.js diagnostics --base-url http://127.0.0.1:62000
+```
+
+The underlying endpoint is local-only and is not cached:
+
+```text
+GET /api/diagnostics/miniapp
+```
+
 ## SQLCipher API
 
 The HTTP API can inspect SQLCipher-protected `.db` files from a configured

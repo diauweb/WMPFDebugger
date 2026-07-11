@@ -6,8 +6,9 @@ const printUsage = () => {
     console.log(`Usage:
   node scripts/test-api.js status [--base-url <url>]
   node scripts/test-api.js list [--base-url <url>]
+  node scripts/test-api.js diagnostics [--base-url <url>]
   node scripts/test-api.js spawn <appid> [--base-url <url>]
-  node scripts/test-api.js despawn <appid> [--base-url <url>]
+  node scripts/test-api.js despawn <appid> [--base-url <url>] [--allow-launch-correlated]
   node scripts/test-api.js sqlcipher-list [--base-url <url>]
   node scripts/test-api.js sqlcipher-query <database> <sql> [--base-url <url>] [--params <json>] [--max-rows <n>]
   node scripts/test-api.js sqlcipher-smoke <database> [--base-url <url>]
@@ -27,6 +28,7 @@ const parseArgs = (argv) => {
     let waitMs = 4000;
     let params = [];
     let maxRows = undefined;
+    let allowLaunchCorrelated = false;
 
     for (let i = 1; i < args.length; i += 1) {
         const value = args[i];
@@ -50,10 +52,22 @@ const parseArgs = (argv) => {
             maxRows = Number(args[i] || "0");
             continue;
         }
+        if (value === "--allow-launch-correlated") {
+            allowLaunchCorrelated = true;
+            continue;
+        }
         positional.push(value);
     }
 
-    return { command, baseUrl, waitMs, params, maxRows, positional };
+    return {
+        command,
+        baseUrl,
+        waitMs,
+        params,
+        maxRows,
+        allowLaunchCorrelated,
+        positional,
+    };
 };
 
 const request = async (baseUrl, pathname, init) => {
@@ -93,6 +107,12 @@ const listMiniapps = async (baseUrl) => {
     });
 };
 
+const getMiniappDiagnostics = async (baseUrl) => {
+    return request(baseUrl, "/api/diagnostics/miniapp", {
+        method: "GET",
+    });
+};
+
 const spawnMiniapp = async (baseUrl, appid) => {
     return request(baseUrl, "/api/miniapps", {
         method: "POST",
@@ -103,8 +123,15 @@ const spawnMiniapp = async (baseUrl, appid) => {
     });
 };
 
-const despawnMiniapp = async (baseUrl, appid) => {
-    return request(baseUrl, `/api/miniapps/${encodeURIComponent(appid)}`, {
+const despawnMiniapp = async (
+    baseUrl,
+    appid,
+    allowLaunchCorrelated = false,
+) => {
+    const query = allowLaunchCorrelated
+        ? "?allowLaunchCorrelated=true"
+        : "";
+    return request(baseUrl, `/api/miniapps/${encodeURIComponent(appid)}${query}`, {
         method: "DELETE",
     });
 };
@@ -197,7 +224,15 @@ const runFull = async (baseUrl, appid, waitMs) => {
 };
 
 const main = async () => {
-    const { command, baseUrl, waitMs, params, maxRows, positional } = parseArgs(process.argv);
+    const {
+        command,
+        baseUrl,
+        waitMs,
+        params,
+        maxRows,
+        allowLaunchCorrelated,
+        positional,
+    } = parseArgs(process.argv);
 
     if (command === "help") {
         printUsage();
@@ -211,6 +246,14 @@ const main = async () => {
 
     if (command === "list") {
         printResult("miniapps", await listMiniapps(baseUrl));
+        return;
+    }
+
+    if (command === "diagnostics") {
+        printResult(
+            "miniapp diagnostics",
+            await getMiniappDiagnostics(baseUrl),
+        );
         return;
     }
 
@@ -232,7 +275,10 @@ const main = async () => {
             process.exitCode = 1;
             return;
         }
-        printResult("despawn", await despawnMiniapp(baseUrl, appid));
+        printResult(
+            "despawn",
+            await despawnMiniapp(baseUrl, appid, allowLaunchCorrelated),
+        );
         return;
     }
 
