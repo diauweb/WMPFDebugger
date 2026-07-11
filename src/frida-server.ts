@@ -79,6 +79,7 @@ type MiniAppWindowHandle = {
     handle: number;
     sequence: number;
     createdAt: number;
+    evidence: "created" | "shown";
     pid?: number;
     threadId?: number;
     className?: string;
@@ -172,6 +173,27 @@ const isWindowObservedPayload = (
     payload !== null &&
     (payload as any).source === "win32-window-recorder" &&
     (payload as any).event === "observed";
+
+const isWindowLifecyclePayload = (
+    payload: unknown,
+): payload is {
+    source: string;
+    event: "show-requested" | "destroyed";
+    hwnd: unknown;
+    api?: unknown;
+    pid?: unknown;
+    threadId?: unknown;
+    command?: unknown;
+    visibleBefore?: unknown;
+    visibleAfter?: unknown;
+    success?: unknown;
+    style?: unknown;
+} =>
+    typeof payload === "object" &&
+    payload !== null &&
+    (payload as any).source === "win32-window-recorder" &&
+    ((payload as any).event === "show-requested" ||
+        (payload as any).event === "destroyed");
 
 const resetAttachmentState = (runtime: FridaRuntimeState) => {
     runtime.pid = undefined;
@@ -322,6 +344,7 @@ const attachFrida = async (
             className?: unknown;
             windowName?: unknown;
         },
+        evidence?: "created" | "shown",
     ) => void,
 ) => {
     const resolvedAt = Date.now();
@@ -375,7 +398,7 @@ const attachFrida = async (
                 if (handle !== undefined) {
                     runtime.lastHookEventAt = Date.now();
                     runtime.lastHookMessage = `window created: 0x${handle.toString(16)}`;
-                    recordMiniAppWindow(handle, message.payload);
+                    recordMiniAppWindow(handle, message.payload, "created");
                 }
             } else if (isWindowObservedPayload(message.payload)) {
                 emitMiniAppDiagnostic(logger, "frida_window_observed", {
@@ -387,6 +410,33 @@ const attachFrida = async (
                     selectable: false,
                     reason: "pre-existing EnumWindows observation",
                 });
+            } else if (isWindowLifecyclePayload(message.payload)) {
+                runtime.lastHookEventAt = Date.now();
+                runtime.lastHookMessage =
+                    `window ${message.payload.event}: ${String(message.payload.hwnd)}`;
+                emitMiniAppDiagnostic(logger, "frida_window_lifecycle", {
+                    attachmentId,
+                    event: message.payload.event,
+                    hwnd: message.payload.hwnd,
+                    api: message.payload.api ?? null,
+                    pid: message.payload.pid ?? null,
+                    tid: message.payload.threadId ?? null,
+                    command: message.payload.command ?? null,
+                    visibleBefore:
+                        message.payload.visibleBefore ?? null,
+                    visibleAfter: message.payload.visibleAfter ?? null,
+                    success: message.payload.success ?? null,
+                    style: message.payload.style ?? null,
+                });
+                if (
+                    message.payload.event === "show-requested" &&
+                    message.payload.visibleAfter === true
+                ) {
+                    const handle = parseWindowHandle(message.payload.hwnd);
+                    if (handle !== undefined) {
+                        recordMiniAppWindow(handle, message.payload, "shown");
+                    }
+                }
             }
             logger.frida_debug("[frida client]", message.payload);
         });
@@ -527,6 +577,7 @@ export const start_frida_server = (logger: Logger): FridaServerHandle => {
             className?: unknown;
             windowName?: unknown;
         },
+        evidence: "created" | "shown" = "created",
     ) => {
         const existingWindow = recordedMiniAppWindows.find(
             (candidate) => candidate.handle === handle,
@@ -535,6 +586,7 @@ export const start_frida_server = (logger: Logger): FridaServerHandle => {
         if (existingWindow) {
             existingWindow.sequence = ++miniAppWindowSequence;
             existingWindow.createdAt = Date.now();
+            existingWindow.evidence = evidence;
             existingWindow.pid = parsePositiveInteger(observation.pid);
             existingWindow.threadId = parsePositiveInteger(
                 observation.threadId,
@@ -551,6 +603,7 @@ export const start_frida_server = (logger: Logger): FridaServerHandle => {
                 handle,
                 sequence: ++miniAppWindowSequence,
                 createdAt: Date.now(),
+                evidence,
                 pid: parsePositiveInteger(observation.pid),
                 threadId: parsePositiveInteger(observation.threadId),
                 className: parseOptionalString(observation.className),
@@ -563,7 +616,7 @@ export const start_frida_server = (logger: Logger): FridaServerHandle => {
             recordedMiniAppWindows.shift();
         }
         logger.info(
-            `[frida] recorded newly-created top-level hwnd: 0x${handle.toString(16)}`,
+            `[frida] recorded top-level hwnd candidate (${evidence}): 0x${handle.toString(16)}`,
             {
                 api: observation.api ?? null,
                 pid: observation.pid ?? null,
@@ -573,6 +626,7 @@ export const start_frida_server = (logger: Logger): FridaServerHandle => {
         );
         emitMiniAppDiagnostic(logger, "frida_window_created", {
             sequence: recordedWindow.sequence,
+            evidence,
             observedAt: new Date(recordedWindow.createdAt).toISOString(),
             hwnd: `0x${handle.toString(16)}`,
             pid: recordedWindow.pid ?? null,

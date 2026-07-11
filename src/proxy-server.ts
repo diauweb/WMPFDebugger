@@ -200,13 +200,20 @@ export const proxy_server = (
             return existing;
         }
 
+        let pendingSpawn: PendingSpawn;
         const timeout = setTimeout(() => {
+            const retainedSession =
+                debugServer.retainPendingLaunchWindow(pendingSpawn);
             rejectPendingSpawn(
                 appid,
-                new Error("miniapp did not become ready in time"),
+                new Error(
+                    retainedSession
+                        ? "miniapp launched but did not attach; launch-correlated window retained for explicit cleanup"
+                        : "miniapp did not become ready in time",
+                ),
             );
         }, PENDING_SPAWN_TIMEOUT_MS);
-        const pendingSpawn = {
+        pendingSpawn = {
             id: randomUUID(),
             appid,
             createdAt: Date.now(),

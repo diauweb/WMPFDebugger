@@ -12,6 +12,13 @@ const patchWin32WindowRecorder = () => {
     const createWindowExWPtr = findWin32Export("user32.dll", "CreateWindowExW");
     const createWindowExAPtr = findWin32Export("user32.dll", "CreateWindowExA");
     const enumWindowsPtr = findWin32Export("user32.dll", "EnumWindows");
+    const destroyWindowPtr = findWin32Export("user32.dll", "DestroyWindow");
+    const showWindowPtr = findWin32Export("user32.dll", "ShowWindow");
+    const getWindowLongWPtr = findWin32Export("user32.dll", "GetWindowLongW");
+    const isWindowVisiblePtr = findWin32Export(
+        "user32.dll",
+        "IsWindowVisible",
+    );
     const getWindowThreadProcessIdPtr = findWin32Export(
         "user32.dll",
         "GetWindowThreadProcessId",
@@ -25,6 +32,20 @@ const patchWin32WindowRecorder = () => {
     const WS_CHILD = 0x40000000;
     const NULL_HWND = ptr("0");
     const currentPid = Process.id;
+    const getWindowLongW = getWindowLongWPtr
+        ? new NativeFunction(getWindowLongWPtr, "int", ["pointer", "int"])
+        : null;
+    const isWindowVisible = isWindowVisiblePtr
+        ? new NativeFunction(isWindowVisiblePtr, "bool", ["pointer"])
+        : null;
+
+    const readTopLevelStyle = (hwnd) => {
+        if (!getWindowLongW || !hwnd || hwnd.isNull()) {
+            return null;
+        }
+        const style = getWindowLongW(hwnd, -16) >>> 0;
+        return (style & WS_CHILD) === 0 ? style : null;
+    };
 
     const readWindowString = (value, wide) => {
         if (!value || value.isNull()) {
@@ -99,6 +120,64 @@ const patchWin32WindowRecorder = () => {
 
     attachCreateWindowHook(createWindowExWPtr, "CreateWindowExW", true);
     attachCreateWindowHook(createWindowExAPtr, "CreateWindowExA", false);
+
+    if (showWindowPtr && isWindowVisible) {
+        Interceptor.attach(showWindowPtr, {
+            onEnter(args) {
+                this.hwnd = args[0];
+                this.command = args[1].toInt32();
+                this.style = readTopLevelStyle(this.hwnd);
+                this.visibleBefore = this.style === null
+                    ? false
+                    : Boolean(isWindowVisible(this.hwnd));
+            },
+            onLeave() {
+                if (this.style === null) {
+                    return;
+                }
+                const visibleAfter = Boolean(isWindowVisible(this.hwnd));
+                emitRecordedWindow(
+                    "show-requested",
+                    this.hwnd,
+                    "ShowWindow",
+                    NULL_HWND,
+                    {
+                        threadId: Process.getCurrentThreadId(),
+                        command: this.command,
+                        visibleBefore: this.visibleBefore,
+                        visibleAfter,
+                        style: `0x${this.style.toString(16)}`,
+                    },
+                );
+            },
+        });
+    }
+
+    if (destroyWindowPtr) {
+        Interceptor.attach(destroyWindowPtr, {
+            onEnter(args) {
+                this.hwnd = args[0];
+                this.style = readTopLevelStyle(this.hwnd);
+                this.threadId = Process.getCurrentThreadId();
+            },
+            onLeave(retval) {
+                if (this.style === null) {
+                    return;
+                }
+                emitRecordedWindow(
+                    "destroyed",
+                    this.hwnd,
+                    "DestroyWindow",
+                    NULL_HWND,
+                    {
+                        threadId: this.threadId,
+                        success: Boolean(retval.toInt32()),
+                        style: `0x${this.style.toString(16)}`,
+                    },
+                );
+            },
+        });
+    }
 
     if (enumWindowsPtr && getWindowThreadProcessIdPtr) {
         const enumWindows = new NativeFunction(enumWindowsPtr, "bool", [

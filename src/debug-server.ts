@@ -406,6 +406,159 @@ export const debug_server = (
     const sleep = (ms: number) =>
         new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+    const retainPendingLaunchWindow = (pendingSpawn: PendingSpawn) => {
+        const existing = Array.from(sessions.values()).find(
+            (session) =>
+                session.id === pendingSpawn.appid ||
+                session.requestedAppId === pendingSpawn.appid,
+        );
+        if (existing) {
+            return existing;
+        }
+
+        const fridaStatus = fridaServer.getStatus();
+        if (fridaStatus.pid === null) {
+            emitMiniAppDiagnostic(
+                logger,
+                "launch_window_retention_skipped",
+                {
+                    launchId: pendingSpawn.id,
+                    appid: pendingSpawn.appid,
+                    reason: "frida_pid_unresolved",
+                },
+            );
+            return undefined;
+        }
+
+        const candidates = fridaServer.listMiniAppWindowCandidates({
+            afterSequence: pendingSpawn.windowCursor,
+            createdAfter: pendingSpawn.createdAt,
+            createdBefore: Date.now(),
+            pid: fridaStatus.pid,
+        });
+        if (candidates.length !== 1) {
+            emitMiniAppDiagnostic(
+                logger,
+                "launch_window_retention_skipped",
+                {
+                    launchId: pendingSpawn.id,
+                    appid: pendingSpawn.appid,
+                    reason:
+                        candidates.length === 0
+                            ? "no_launch_window_event"
+                            : "ambiguous_launch_window_events",
+                    candidateCount: candidates.length,
+                    candidates: candidates.map((candidate) => ({
+                        sequence: candidate.sequence,
+                        evidence: candidate.evidence,
+                        hwnd: `0x${candidate.handle.toString(16)}`,
+                        pid: candidate.pid ?? null,
+                        tid: candidate.threadId ?? null,
+                    })),
+                },
+            );
+            return undefined;
+        }
+
+        const candidate = candidates[0];
+        if (
+            candidate.pid === undefined ||
+            candidate.threadId === undefined
+        ) {
+            return undefined;
+        }
+        const inspection = inspectWin32WindowIdentity(
+            candidate.handle,
+            candidate.pid,
+        );
+        const window = inspection.snapshot;
+        const expectedHwnd = `0x${candidate.handle.toString(16)}`;
+        if (
+            !inspection.windowCheckCompleted ||
+            !inspection.windowExists ||
+            !window ||
+            !window.visible ||
+            window.hwnd.toLowerCase() !== expectedHwnd ||
+            window.pid !== candidate.pid ||
+            window.tid !== candidate.threadId ||
+            (candidate.className !== undefined &&
+                window.className !== candidate.className) ||
+            inspection.processStartTime === null
+        ) {
+            emitMiniAppDiagnostic(
+                logger,
+                "launch_window_retention_skipped",
+                {
+                    launchId: pendingSpawn.id,
+                    appid: pendingSpawn.appid,
+                    reason: "launch_window_revalidation_failed",
+                    candidate: {
+                        evidence: candidate.evidence,
+                        hwnd: expectedHwnd,
+                        pid: candidate.pid,
+                        tid: candidate.threadId,
+                        className: candidate.className ?? null,
+                    },
+                    inspection: {
+                        windowCheckCompleted:
+                            inspection.windowCheckCompleted,
+                        windowExists: inspection.windowExists,
+                        processStartTime: inspection.processStartTime,
+                        snapshot: window
+                            ? {
+                                  hwnd: window.hwnd,
+                                  pid: window.pid,
+                                  tid: window.tid,
+                                  className: window.className,
+                                  visible: window.visible,
+                              }
+                            : null,
+                        errors: inspection.errors,
+                    },
+                },
+            );
+            return undefined;
+        }
+
+        const session = createSession(pendingSpawn.appid);
+        session.state = "closing";
+        session.lastError =
+            "miniapp launched a window but did not attach to the debugger";
+        session.launchId = pendingSpawn.id;
+        session.launchStartedAt = pendingSpawn.createdAt;
+        session.launchWindowCursor = pendingSpawn.windowCursor;
+        session.launchAppIdConfirmed = false;
+        session.windowHandle = candidate.handle;
+        session.windowIdentity = {
+            handle: candidate.handle,
+            pid: window.pid,
+            tid: window.tid,
+            className: window.className,
+            owner: window.owner,
+            root: window.root,
+            rootOwner: window.rootOwner,
+            launchId: pendingSpawn.id,
+            fridaObservedAt: candidate.createdAt,
+            processStartTime: inspection.processStartTime,
+            appIdConfirmed: false,
+            verifiedAt: Date.now(),
+        };
+        touchSession(session);
+        sessions.set(session.id, session);
+        emitMiniAppDiagnostic(logger, "launch_window_retained", {
+            ...diagnosticSession(session),
+            launchId: pendingSpawn.id,
+            appid: pendingSpawn.appid,
+            evidence: candidate.evidence,
+            hwnd: expectedHwnd,
+            pid: window.pid,
+            tid: window.tid,
+            className: window.className,
+            explicitCloseRequiresLaunchCorrelation: true,
+        });
+        return session;
+    };
+
     const classifyWindowCandidates = (breakdown: {
         afterCursor: number;
         withinTimeWindow: number;
@@ -1946,6 +2099,7 @@ export const debug_server = (
         killMiniApp,
         evaluateInAppContext,
         promoteSessionAttachment,
+        retainPendingLaunchWindow,
         sendMiniAppCdpMessage,
     };
 };
