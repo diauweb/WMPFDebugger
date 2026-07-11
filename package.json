@@ -7,7 +7,6 @@
   "scripts": {
     "start": "bun run src/index.ts",
     "start:watchdog": "node scripts/run-with-restart.js",
-    "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

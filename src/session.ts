@@ -9,6 +9,11 @@ export type PendingCommand = {
     timeout: NodeJS.Timeout;
 };
 
+export type PendingSpawnWaiter = {
+    resolve: (session: MiniAppSession) => void;
+    reject: (error: Error) => void;
+};
+
 export type PendingContext = {
     frameId?: string;
     resolve: (contextId: number) => void;
@@ -28,21 +33,19 @@ export type AppServiceBinding = {
     contextId: number;
 };
 
-export type AppServiceBootstrapBinding = {
-    targetId: string;
-    sessionId: string;
-    frameId?: string;
-    contextId?: number;
-};
-
 export type MiniAppSessionState = "bootstrapping" | "ready" | "closing";
+
+export type PendingSpawn = {
+    appid: string;
+    createdAt: number;
+    timeout: NodeJS.Timeout;
+    waiters: Set<PendingSpawnWaiter>;
+};
 
 export type MiniAppSession = {
     id: string;
     title: string;
     requestedAppId?: string;
-    resolvedAppId?: string;
-    launchAttemptId?: number;
     state: MiniAppSessionState;
     lastError?: string;
     attached: boolean;
@@ -51,9 +54,6 @@ export type MiniAppSession = {
     debugSocket?: WebSocket;
     devtoolsSocket?: WebSocket;
     windowHandle?: number;
-    windowClosureObserved?: boolean;
-    windowFallbackInProgress?: boolean;
-    windowFallbackRequiresOpenSocket?: boolean;
     launchStartedAt?: number;
     messageCounter: number;
     internalCommandCounter: number;
@@ -62,7 +62,6 @@ export type MiniAppSession = {
     closeWaiters: Set<CloseWaiter>;
     foregroundKeepAlive?: NodeJS.Timeout;
     appService?: AppServiceBinding;
-    appServiceBootstrap?: AppServiceBootstrapBinding;
 };
 
 export type CdpFrameTree = {
@@ -76,10 +75,7 @@ export type CdpFrameTree = {
 
 export const INTERNAL_CDP_ID_BASE = 1_000_000_000;
 export const INTERNAL_CDP_TIMEOUT_MS = 5_000;
-export const FRIDA_HOOK_READY_TIMEOUT_MS = 20_000;
-export const MINIAPP_CONNECTION_TIMEOUT_MS = 45_000;
-export const MINIAPP_BOOTSTRAP_TIMEOUT_MS = 45_000;
-export const MAX_MINIAPP_LAUNCH_DISPATCHES = 2;
+export const PENDING_SPAWN_TIMEOUT_MS = 15_000;
 
 export const bufferToHexString = (buffer: Buffer) => {
     return Array.from(buffer)
@@ -142,9 +138,8 @@ export const flattenFrameTree = (tree?: CdpFrameTree): CdpFrameTree["frame"][] =
 
 export const serializeSession = (options: CliOptions, session: MiniAppSession) => ({
     id: session.id,
-    appid: session.resolvedAppId ?? session.requestedAppId ?? session.id,
+    appid: session.id,
     requestedAppId: session.requestedAppId ?? null,
-    resolvedAppId: session.resolvedAppId ?? null,
     state: session.state,
     lastError: session.lastError ?? null,
     windowHandle:
