@@ -7,7 +7,7 @@ const printUsage = () => {
   node scripts/test-api.js status [--base-url <url>]
   node scripts/test-api.js list [--base-url <url>]
   node scripts/test-api.js spawn <appid> [--base-url <url>]
-  node scripts/test-api.js despawn <appid> [--base-url <url>] [--allow-launch-correlated]
+  node scripts/test-api.js despawn <appid> [--base-url <url>]
   node scripts/test-api.js sqlcipher-list [--base-url <url>]
   node scripts/test-api.js sqlcipher-query <database> <sql> [--base-url <url>] [--params <json>] [--max-rows <n>]
   node scripts/test-api.js sqlcipher-smoke <database> [--base-url <url>]
@@ -27,8 +27,6 @@ const parseArgs = (argv) => {
     let waitMs = 4000;
     let params = [];
     let maxRows = undefined;
-    let allowLaunchCorrelated = false;
-
     for (let i = 1; i < args.length; i += 1) {
         const value = args[i];
         if (value === "--base-url") {
@@ -51,10 +49,6 @@ const parseArgs = (argv) => {
             maxRows = Number(args[i] || "0");
             continue;
         }
-        if (value === "--allow-launch-correlated") {
-            allowLaunchCorrelated = true;
-            continue;
-        }
         positional.push(value);
     }
 
@@ -64,7 +58,6 @@ const parseArgs = (argv) => {
         waitMs,
         params,
         maxRows,
-        allowLaunchCorrelated,
         positional,
     };
 };
@@ -116,15 +109,8 @@ const spawnMiniapp = async (baseUrl, appid) => {
     });
 };
 
-const despawnMiniapp = async (
-    baseUrl,
-    appid,
-    allowLaunchCorrelated = false,
-) => {
-    const query = allowLaunchCorrelated
-        ? "?allowLaunchCorrelated=true"
-        : "";
-    return request(baseUrl, `/api/miniapps/${encodeURIComponent(appid)}${query}`, {
+const despawnMiniapp = async (baseUrl, appid) => {
+    return request(baseUrl, `/api/miniapps/${encodeURIComponent(appid)}`, {
         method: "DELETE",
     });
 };
@@ -223,7 +209,6 @@ const main = async () => {
         waitMs,
         params,
         maxRows,
-        allowLaunchCorrelated,
         positional,
     } = parseArgs(process.argv);
 
@@ -262,7 +247,7 @@ const main = async () => {
         }
         printResult(
             "despawn",
-            await despawnMiniapp(baseUrl, appid, allowLaunchCorrelated),
+            await despawnMiniapp(baseUrl, appid),
         );
         return;
     }

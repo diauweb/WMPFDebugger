@@ -21,11 +21,6 @@ export type PendingContext = {
     timeout: NodeJS.Timeout;
 };
 
-export type CloseWaiter = {
-    resolve: () => void;
-    timeout: NodeJS.Timeout;
-};
-
 export type AppServiceBinding = {
     targetId: string;
     sessionId: string;
@@ -39,13 +34,7 @@ export type MiniAppWindowIdentity = {
     tid: number;
     className: string;
     title?: string;
-    owner: string | null;
-    root: string | null;
-    rootOwner: string | null;
     launchId: string;
-    fridaObservedAt: number;
-    processStartTime: string;
-    appIdConfirmed: boolean;
     verifiedAt: number;
 };
 
@@ -75,7 +64,6 @@ export type MiniAppSession = {
     devtoolsSocket?: WebSocket;
     windowHandle?: number;
     windowIdentity?: MiniAppWindowIdentity;
-    transportPid?: number;
     closeInProgress?: boolean;
     launchId?: string;
     launchStartedAt?: number;
@@ -90,7 +78,6 @@ export type MiniAppSession = {
     lastMessageReceivedAt?: number;
     pendingCommands: Map<number, PendingCommand>;
     pendingContexts: Map<string, PendingContext>;
-    closeWaiters: Set<CloseWaiter>;
     foregroundKeepAlive?: NodeJS.Timeout;
     healthCheck?: NodeJS.Timeout;
     appService?: AppServiceBinding;
@@ -155,7 +142,6 @@ export const createSession = (appid?: string): MiniAppSession => ({
     evaluationFailures: 0,
     pendingCommands: new Map(),
     pendingContexts: new Map(),
-    closeWaiters: new Set(),
 });
 
 export const flattenFrameTree = (tree?: CdpFrameTree): CdpFrameTree["frame"][] => {
@@ -182,7 +168,6 @@ export const serializeSession = (options: CliOptions, session: MiniAppSession) =
         session.windowHandle === undefined
             ? null
             : `0x${session.windowHandle.toString(16)}`,
-    transportPid: session.transportPid ?? null,
     windowIdentityVerified: session.windowIdentity !== undefined,
     evaluationSuccesses: session.evaluationSuccesses,
     evaluationFailures: session.evaluationFailures,

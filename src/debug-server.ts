@@ -14,7 +14,6 @@ import {
     AppServiceBinding,
     PendingSpawn,
     CdpFrameTree,
-    CloseWaiter,
     INTERNAL_CDP_TIMEOUT_MS,
     bufferToHexString,
     rawDataToBuffer,
@@ -173,7 +172,6 @@ export const debug_server = (
     const bindPendingSpawn = (
         session: MiniAppSession,
         pendingSpawn: PendingSpawn,
-        evidence: "appid" | "window",
     ) => {
         session.requestedAppId = pendingSpawn.appid;
         session.launchId = pendingSpawn.id;
@@ -185,7 +183,6 @@ export const debug_server = (
         logger.info(
             `[miniapp] bound pending spawn ${pendingSpawn.appid} to ${session.id}`,
         );
-        
     };
 
     const resolvePendingSpawn = (appid: string, session: MiniAppSession) => {
@@ -202,7 +199,7 @@ export const debug_server = (
 
         clearTimeout(pendingSpawn.timeout);
         pendingSpawns.delete(appid);
-        
+
         for (const waiter of pendingSpawn.waiters) {
             waiter.resolve(session);
         }
@@ -217,7 +214,7 @@ export const debug_server = (
 
         clearTimeout(pendingSpawn.timeout);
         pendingSpawns.delete(appid);
-        
+
         for (const waiter of pendingSpawn.waiters) {
             waiter.reject(error);
         }
@@ -256,14 +253,6 @@ export const debug_server = (
             pending.reject(new Error(message));
             session.pendingContexts.delete(key);
         }
-    };
-
-    const resolveCloseWaiters = (session: MiniAppSession) => {
-        for (const waiter of session.closeWaiters) {
-            clearTimeout(waiter.timeout);
-            waiter.resolve();
-        }
-        session.closeWaiters.clear();
     };
 
     const stopForegroundKeepAlive = (session: MiniAppSession) => {
@@ -326,7 +315,6 @@ export const debug_server = (
         stopForegroundKeepAlive(session);
         stopSessionHealthCheck(session);
         rejectPendingWork(session, reason);
-        resolveCloseWaiters(session);
         removeSession(session);
 
         if (debugSocket) {
@@ -369,7 +357,6 @@ export const debug_server = (
         stopForegroundKeepAlive(session);
         stopSessionHealthCheck(session);
         rejectPendingWork(session, reason);
-        resolveCloseWaiters(session);
 
         const retainedForExplicitClose = hasLiveWindow(session);
         if (!retainedForExplicitClose) {
@@ -400,7 +387,7 @@ export const debug_server = (
 
         const fridaStatus = fridaServer.getStatus();
         if (fridaStatus.pid === null) {
-            
+
             return undefined;
         }
 
@@ -411,7 +398,7 @@ export const debug_server = (
             pid: fridaStatus.pid,
         });
         if (candidates.length !== 1) {
-            
+
             return undefined;
         }
 
@@ -434,10 +421,9 @@ export const debug_server = (
             window.pid !== candidate.pid ||
             window.tid !== candidate.tid ||
             (candidate.className !== undefined &&
-                window.className !== candidate.className) ||
-            inspection.processStartTime === null
+                window.className !== candidate.className)
         ) {
-            
+
             return undefined;
         }
 
@@ -455,18 +441,12 @@ export const debug_server = (
             pid: window.pid,
             tid: window.tid,
             className: window.className,
-            owner: window.owner,
-            root: window.root,
-            rootOwner: window.rootOwner,
             launchId: pendingSpawn.id,
-            fridaObservedAt: candidate.createdAt,
-            processStartTime: inspection.processStartTime,
-            appIdConfirmed: false,
             verifiedAt: Date.now(),
         };
         touchSession(session);
         sessions.set(session.id, session);
-        
+
         return session;
     };
 
@@ -488,13 +468,7 @@ export const debug_server = (
             tid: window.tid,
             className: window.className,
             title: window.title,
-            owner: null,
-            root: null,
-            rootOwner: null,
             launchId: session.launchId ?? "",
-            fridaObservedAt: Date.now(),
-            processStartTime: "",
-            appIdConfirmed: session.launchAppIdConfirmed === true,
             verifiedAt: Date.now(),
         };
         if (session.requestedAppId) {
@@ -910,7 +884,7 @@ export const debug_server = (
             typeof appId === "string" && appId.trim().length > 0
                 ? appId.trim()
                 : "";
-        
+
         logger.info(
             `[miniapp] account info for ${session.id}: ` +
                 `appid=${appidValue || "<blank>"}, ` +
@@ -977,14 +951,14 @@ export const debug_server = (
             session.evaluationSuccesses += 1;
             session.lastEvaluationSucceededAt = Date.now();
             touchSession(session);
-            
+
             return result;
         } catch (error) {
             session.evaluationFailures += 1;
             session.lastEvaluationFailedAt = Date.now();
             touchSession(session);
             healthCheckRequested.add(session);
-            
+
             throw error;
         }
     };
@@ -1036,7 +1010,7 @@ export const debug_server = (
                 logger.info(
                     `[miniapp] health check failed for ${session.id}: ${formatErrorMessage(error)}; attempting recovery`,
                 );
-                
+
                 try {
                     await discoverAppContext(session, {
                         forceAttach: true,
@@ -1045,13 +1019,13 @@ export const debug_server = (
                     await probeSession();
                     touchSession(session);
                     logger.info(`[miniapp] recovery succeeded for ${session.id}`);
-                    
+
                 } catch (recoveryError) {
                     logger.error(
                         `[miniapp] recovery failed for ${session.id}:`,
                         recoveryError,
                     );
-                    
+
                     teardownSession(
                         session,
                         "miniapp stopped responding to commands",
@@ -1096,21 +1070,16 @@ export const debug_server = (
                 logger.info(
                     `[miniapp] alternate attachment ready for ${appid}: keeping canonical ${existing.traceId}, candidate ${session.traceId}`,
                 );
-                
+
                 return "alternate" as const;
             }
 
-            if (
-                existing.transportPid !== undefined &&
-                existing.transportPid === session.transportPid
-            ) {
-                session.launchId ??= existing.launchId;
-                session.launchStartedAt ??= existing.launchStartedAt;
-                session.launchWindowCursor ??= existing.launchWindowCursor;
-                session.launchAppIdConfirmed ||= existing.launchAppIdConfirmed;
-                session.windowHandle ??= existing.windowHandle;
-                session.windowIdentity ??= existing.windowIdentity;
-            }
+            session.launchId ??= existing.launchId;
+            session.launchStartedAt ??= existing.launchStartedAt;
+            session.launchWindowCursor ??= existing.launchWindowCursor;
+            session.launchAppIdConfirmed ||= existing.launchAppIdConfirmed;
+            session.windowHandle ??= existing.windowHandle;
+            session.windowIdentity ??= existing.windowIdentity;
             sessions.delete(appid);
             existing.state = "closing";
             existing.lastError = "superseded by a working attachment";
@@ -1120,7 +1089,7 @@ export const debug_server = (
             logger.info(
                 `[miniapp] replacing stale attachment for ${appid}: ${existing.traceId} -> ${session.traceId}`,
             );
-            
+
         }
 
         const previousId = session.id;
@@ -1160,7 +1129,6 @@ export const debug_server = (
 
         canonical.debugSocket = candidateSocket;
         canonical.appService = candidate.appService;
-        canonical.transportPid = candidate.transportPid;
         canonical.state = "ready";
         canonical.lastError = undefined;
         canonical.messageCounter = Math.max(
@@ -1232,13 +1200,13 @@ export const debug_server = (
         logger.info(
             `[miniapp] promoted successful attachment for ${appid}: ${candidate.traceId} -> ${canonical.traceId}`,
         );
-        
+
         return canonical;
     };
 
     const bootstrapSession = async (session: MiniAppSession) => {
         const bootstrapStartedAt = Date.now();
-        
+
         let bootstrapAttempt = 0;
         while (true) {
             bootstrapAttempt += 1;
@@ -1253,7 +1221,7 @@ export const debug_server = (
                         matchingPendingSpawn &&
                         matchingPendingSpawn.boundSessionId === undefined
                     ) {
-                        bindPendingSpawn(session, matchingPendingSpawn, "appid");
+                        bindPendingSpawn(session, matchingPendingSpawn);
                     }
                 }
                 const expectedAppId = session.requestedAppId;
@@ -1275,7 +1243,7 @@ export const debug_server = (
                     logger.error(
                         `[miniapp] ${mismatchMessage}; HWND candidate discarded`,
                     );
-                    
+
                 }
                 if (appid) {
                     session.title = appid;
@@ -1284,9 +1252,6 @@ export const debug_server = (
                 }
                 if (!launchMismatch) {
                     session.launchAppIdConfirmed = true;
-                    if (session.windowIdentity) {
-                        session.windowIdentity.appIdConfirmed = true;
-                    }
                 }
                 captureWindowIdentity(session);
                 session.state = "ready";
@@ -1298,7 +1263,7 @@ export const debug_server = (
                     resolvePendingSpawn(appid, session);
                 }
                 logger.info(`[miniapp] miniapp ready: ${session.id}`);
-                
+
                 return;
             } catch (error) {
                 const errorMessage = formatErrorMessage(error);
@@ -1308,7 +1273,7 @@ export const debug_server = (
                     logger.info(
                         `[miniapp] bootstrap stopped for ${session.id} because explicit close is in progress`,
                     );
-                    
+
                     return;
                 }
                 if (
@@ -1318,7 +1283,7 @@ export const debug_server = (
                     logger.info(
                         `[miniapp] bootstrap attempt ${bootstrapAttempt} failed for ${session.id}; retrying`,
                     );
-                    
+
                     await sleep(BOOTSTRAP_RETRY_INTERVAL_MS);
                     continue;
                 }
@@ -1331,7 +1296,7 @@ export const debug_server = (
                     `[miniapp] bootstrap failed for ${session.id}:`,
                     error,
                 );
-                
+
                 rejectSessionPendingSpawn(session, new Error(closeMessage));
                 if (
                     session.debugSocket &&
@@ -1453,21 +1418,21 @@ export const debug_server = (
                 pid: identity.pid,
                 tid: identity.tid,
             });
-            
+
         } catch (error) {
-            
+
             throw error;
         }
         const deadline = Date.now() + INTERNAL_CDP_TIMEOUT_MS;
         while (Date.now() < deadline) {
             if (!is_window(identity.handle)) {
-                
+
                 return;
             }
             await sleep(MINIAPP_WINDOW_WAIT_INTERVAL_MS);
         }
 
-        
+
 
         throw new Error(
             `miniapp window did not close: 0x${identity.handle.toString(16)}`,
@@ -1632,7 +1597,6 @@ export const debug_server = (
     const killMiniApp = async (
         session: MiniAppSession,
         reason: string,
-        _options: { allowLaunchCorrelated?: boolean } = {},
     ) => {
         session.closeInProgress = true;
         session.state = "closing";
@@ -1721,12 +1685,12 @@ export const debug_server = (
         ) {
             return null;
         }
-        
+
         const result = await killMiniApp(
             session,
             "stale session replaced by a new launch",
         );
-        
+
         return result;
     };
 
@@ -1737,7 +1701,7 @@ export const debug_server = (
         sessions.set(session.id, session);
         debugSocketSessions.set(ws, session);
         logger.info(`[miniapp] miniapp client connected: ${session.id}`);
-        
+
         ws.on("message", (message) => {
             const currentSession = debugSocketSessions.get(ws);
             if (currentSession) {
@@ -1773,7 +1737,7 @@ export const debug_server = (
                     ? `[miniapp] miniapp client disconnected: ${currentSession.id}; retaining cached hwnd for explicit close`
                     : `[miniapp] miniapp client disconnected: ${currentSession.id}`,
             );
-            
+
         });
 
         void bootstrapSession(session).finally(() => {

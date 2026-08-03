@@ -30,7 +30,6 @@ type Win32WindowInspection = {
     windowCheckCompleted: boolean;
     windowExists: boolean;
     snapshot: Win32WindowSnapshot | null;
-    processStartTime: string | null;
     errors: string[];
 };
 
@@ -41,7 +40,6 @@ const GWL_STYLE = -16;
 const GWL_EXSTYLE = -20;
 const MAX_WINDOW_TEXT_LENGTH = 4096;
 const MAX_CLASS_NAME_LENGTH = 512;
-const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 
 const getErrorMessage = (error: unknown) =>
     error instanceof Error ? error.message : String(error);
@@ -247,67 +245,6 @@ const openUser32 = () =>
         },
     });
 
-const readProcessStartTime = (pid: number) => {
-    let kernel32: ReturnType<typeof dlopen> | null = null;
-    let processHandle = 0n;
-    try {
-        kernel32 = dlopen("kernel32.dll", {
-            OpenProcess: {
-                args: ["u32", "i32", "u32"],
-                returns: "u64",
-            },
-            GetProcessTimes: {
-                args: ["u64", "ptr", "ptr", "ptr", "ptr"],
-                returns: "i32",
-            },
-            CloseHandle: {
-                args: ["u64"],
-                returns: "i32",
-            },
-        });
-        processHandle = handleToBigInt(
-            kernel32.symbols.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION,
-                0,
-                pid,
-            ),
-        );
-        if (processHandle === 0n) {
-            throw new Error(`OpenProcess(${pid}) failed`);
-        }
-
-        const creation = new Uint32Array(2);
-        const exit = new Uint32Array(2);
-        const kernel = new Uint32Array(2);
-        const user = new Uint32Array(2);
-        if (
-            !kernel32.symbols.GetProcessTimes(
-                processHandle,
-                creation,
-                exit,
-                kernel,
-                user,
-            )
-        ) {
-            throw new Error(`GetProcessTimes(${pid}) failed`);
-        }
-
-        return (
-            (BigInt(creation[1]) << 32n) | BigInt(creation[0])
-        ).toString();
-    } finally {
-        if (kernel32 && processHandle !== 0n) {
-            kernel32.symbols.CloseHandle(processHandle);
-        }
-        kernel32?.close?.();
-    }
-};
-
-/**
- * Correlate a connected socket with its exact reversed TCP row and inventory
- * top-level windows owned by that transport PID. Ambiguity returns no PID and
- * no HWND inventory; it never guesses.
- */
 const inspectWin32WindowIdentity = (
     handle: number | bigint,
     expectedPid: number,
@@ -317,7 +254,6 @@ const inspectWin32WindowIdentity = (
         windowCheckCompleted: false,
         windowExists: false,
         snapshot: null,
-        processStartTime: null,
         errors: [],
     };
     if (process.platform !== "win32") {
@@ -333,14 +269,6 @@ const inspectWin32WindowIdentity = (
     if (normalizedHandle === 0n || !Number.isSafeInteger(expectedPid) || expectedPid <= 0) {
         result.errors.push("a valid HWND and expected PID are required");
         return result;
-    }
-
-    try {
-        result.processStartTime = readProcessStartTime(expectedPid);
-    } catch (error) {
-        result.errors.push(
-            `process start-time lookup failed: ${getErrorMessage(error)}`,
-        );
     }
 
     let user32: ReturnType<typeof dlopen> | null = null;

@@ -113,7 +113,6 @@ type HookEventPayload = {
     className?: unknown;
     title?: unknown;
     visible?: unknown;
-    visibleBefore?: unknown;
     visibleAfter?: unknown;
     scene?: unknown;
     message?: unknown;

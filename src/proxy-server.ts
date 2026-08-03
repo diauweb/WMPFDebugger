@@ -32,7 +32,9 @@ export const proxy_server = (
     fridaServer: FridaServerHandle,
 ) => {
     const pageWss = new WebSocketServer({ noServer: true });
-    const legacyWss = new WebSocketServer({ noServer: true });
+    // Root websocket path: the quick-start entry point
+    // (devtools://devtools/bundled/inspector.html?ws=127.0.0.1:62000).
+    const rootWss = new WebSocketServer({ noServer: true });
     const evaluationTails = new Map<string, Promise<void>>();
     const sqlcipherService = create_sqlcipher_service(
         logger,
@@ -113,12 +115,12 @@ export const proxy_server = (
 
     const findCloseSession = (sessionId: string) =>
         listSessionCandidates(sessionId).sort((left, right) => {
-            const proofScore = (session: MiniAppSession) =>
-                (session.windowIdentity ? 8 : 0) +
-                (session.windowIdentity?.appIdConfirmed ? 4 : 0) +
-                (session.windowHandle !== undefined ? 2 : 0) +
-                (session.launchId ? 1 : 0);
-            return proofScore(right) - proofScore(left);
+            const leftHasWindow = left.windowHandle !== undefined ? 1 : 0;
+            const rightHasWindow = right.windowHandle !== undefined ? 1 : 0;
+            if (leftHasWindow !== rightHasWindow) {
+                return rightHasWindow - leftHasWindow;
+            }
+            return left.createdAt - right.createdAt;
         })[0];
 
     const listReadySessions = (appid: string) =>
@@ -168,7 +170,7 @@ export const proxy_server = (
 
         clearTimeout(pendingSpawn.timeout);
         pendingSpawns.delete(appid);
-        
+
         for (const waiter of pendingSpawn.waiters) {
             waiter.reject(error);
         }
@@ -203,7 +205,7 @@ export const proxy_server = (
             waiters: new Set<PendingSpawnWaiter>(),
         };
         pendingSpawns.set(appid, pendingSpawn);
-        
+
         return pendingSpawn;
     };
 
@@ -433,7 +435,7 @@ export const proxy_server = (
             const pendingSpawn = registerPendingSpawn(appid);
             try {
                 const status = await spawn_miniapp(appid);
-                
+
                 logger.info(
                     `[api] spawn requested: ${appid} via ${status.window}; ` +
                         `wndprocResult=${status.messageResult ?? "unavailable"}, ` +
@@ -445,7 +447,7 @@ export const proxy_server = (
                     attached: false,
                 });
             } catch (error) {
-                
+
                 rejectPendingSpawn(
                     appid,
                     new Error("failed to spawn miniapp"),
@@ -500,14 +502,14 @@ export const proxy_server = (
                     const pendingSpawn = registerPendingSpawn(appid);
                     try {
                         const status = await spawn_miniapp(appid);
-                        
+
                         logger.info(
                             `[api] spawn requested for evaluate: ${appid} via ${status.window}; ` +
                                 `wndprocResult=${status.messageResult ?? "unavailable"}, ` +
                                 `resultIsWindow=${status.messageResultIsWindow ?? false}`,
                         );
                     } catch (error) {
-                        
+
                         rejectPendingSpawn(
                             appid,
                             new Error("failed to spawn miniapp"),
@@ -527,7 +529,7 @@ export const proxy_server = (
             };
 
             const evaluateOne = async (candidate: MiniAppSession) => {
-                
+
                 const result = await debugServer.evaluateInAppContext(
                     candidate,
                     expression,
@@ -568,7 +570,7 @@ export const proxy_server = (
                             return;
                         }
                         const failedSession = findSession(appid);
-                        
+
                         logger.error(
                             `[api] miniapp did not become ready for evaluate (${appid}):`,
                             error,
@@ -710,14 +712,9 @@ export const proxy_server = (
             }
 
             try {
-                const allowLaunchCorrelated =
-                    requestUrl.searchParams.get("allowLaunchCorrelated") ===
-                    "true";
-                
                 const closeResult = await debugServer.killMiniApp(
                     session,
                     "miniapp despawn requested",
-                    { allowLaunchCorrelated },
                 );
                 if (closeResult.cleanupComplete && session.requestedAppId) {
                     rejectPendingSpawn(
@@ -725,7 +722,7 @@ export const proxy_server = (
                         new Error("miniapp despawn requested"),
                     );
                 }
-                
+
                 sendJson(response, closeResult.cleanupComplete ? 200 : 409, {
                     ...(closeResult.error
                         ? { error: closeResult.error }
@@ -787,7 +784,7 @@ export const proxy_server = (
                 return;
             }
 
-            legacyWss.handleUpgrade(request, socket, head, (ws) => {
+            rootWss.handleUpgrade(request, socket, head, (ws) => {
                 bindDevTools(activeSessions[0], ws);
             });
             return;
