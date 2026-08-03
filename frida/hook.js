@@ -5,6 +5,8 @@ const getMainModule = (version) => {
     return Process.findModuleByName("WeChatAppEx.exe");
 };
 
+let lastCdpFilterInput = null;
+
 const patchCDPFilter = (base, config) => {
     // xref: SendToClientFilter OR devtools_message_filter_applet_webview.cc
     const offset = config.CDPFilterHookOffset;
@@ -13,10 +15,14 @@ const patchCDPFilter = (base, config) => {
             send(
                 `[patch] CDP filter on enter, original value of input: ${args[0].readPointer()}`,
             );
-            this.inputValue = args[0];
+            lastCdpFilterInput = args[0];
         },
         onLeave(retval) {
-            const inputValue = this.inputValue.readPointer();
+            const input = lastCdpFilterInput;
+            if (!input || input.isNull()) {
+                return;
+            }
+            const inputValue = input.readPointer();
             if (inputValue.isNull() || inputValue.add(8).isNull()) {
                 // there's a chance the value could be null
                 // return here to avoid crash
@@ -48,7 +54,14 @@ const hookOnLoadScene = (a1, sceneOffsets) => {
         .add(16)
         .readPointer()
         .add(sceneOffsets[2]);
-    send(`[hook] scene: ${miniappScenePtr.readInt()}`);
+    const scene = miniappScenePtr.readInt();
+    send(`[hook] scene: ${scene}`);
+    send({
+        source: "wmpf-hook",
+        event: "miniapp-load",
+        scene,
+        at: Date.now(),
+    });
 
     // 1000: from issue #83 <-- will crash the process
     // 1007: from issue #80
@@ -68,8 +81,8 @@ const hookOnLoadScene = (a1, sceneOffsets) => {
         1005, 1007, 1008, 1023, 1027, 1035, 1053, 1074, 1145, 1178, 1256, 1260, 1302,
         1308,
     ];
-    if (!sceneNumberArray.includes(miniappScenePtr.readInt())) {
-        send(`[hook] scene not patched: ${miniappScenePtr.readInt()}`);
+    if (!sceneNumberArray.includes(scene)) {
+        send(`[hook] scene not patched: ${scene}`);
         return;
     }
     send("[hook] hook scene condition -> 1101");

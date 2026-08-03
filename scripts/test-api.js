@@ -6,7 +6,6 @@ const printUsage = () => {
     console.log(`Usage:
   node scripts/test-api.js status [--base-url <url>]
   node scripts/test-api.js list [--base-url <url>]
-  node scripts/test-api.js diagnostics [--base-url <url>]
   node scripts/test-api.js spawn <appid> [--base-url <url>]
   node scripts/test-api.js despawn <appid> [--base-url <url>] [--allow-launch-correlated]
   node scripts/test-api.js sqlcipher-list [--base-url <url>]
@@ -103,12 +102,6 @@ const getStatus = async (baseUrl) => {
 
 const listMiniapps = async (baseUrl) => {
     return request(baseUrl, "/api/miniapps", {
-        method: "GET",
-    });
-};
-
-const getMiniappDiagnostics = async (baseUrl) => {
-    return request(baseUrl, "/api/diagnostics/miniapp", {
         method: "GET",
     });
 };
@@ -246,14 +239,6 @@ const main = async () => {
 
     if (command === "list") {
         printResult("miniapps", await listMiniapps(baseUrl));
-        return;
-    }
-
-    if (command === "diagnostics") {
-        printResult(
-            "miniapp diagnostics",
-            await getMiniappDiagnostics(baseUrl),
-        );
         return;
     }
 

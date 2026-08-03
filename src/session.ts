@@ -38,6 +38,7 @@ export type MiniAppWindowIdentity = {
     pid: number;
     tid: number;
     className: string;
+    title?: string;
     owner: string | null;
     root: string | null;
     rootOwner: string | null;
@@ -86,10 +87,12 @@ export type MiniAppSession = {
     lastEvaluationFailedAt?: number;
     messageCounter: number;
     internalCommandCounter: number;
+    lastMessageReceivedAt?: number;
     pendingCommands: Map<number, PendingCommand>;
     pendingContexts: Map<string, PendingContext>;
     closeWaiters: Set<CloseWaiter>;
     foregroundKeepAlive?: NodeJS.Timeout;
+    healthCheck?: NodeJS.Timeout;
     appService?: AppServiceBinding;
 };
 

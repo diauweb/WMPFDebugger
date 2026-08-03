@@ -3,7 +3,6 @@ import path from "node:path";
 import * as frida from "frida";
 
 import { Logger } from "./logger";
-import { emitMiniAppDiagnostic } from "./miniapp-diagnostics";
 
 type ResolvedWeChatTarget = {
     pid: number;
@@ -79,11 +78,13 @@ type MiniAppWindowHandle = {
     handle: number;
     sequence: number;
     createdAt: number;
-    evidence: "created" | "shown";
-    pid?: number;
-    threadId?: number;
-    className?: string;
-    windowName?: string;
+    evidence: "created" | "shown" | "snapshot";
+    pid: number;
+    tid: number;
+    className: string;
+    title: string;
+    visible: boolean;
+    destroyedAt?: number;
 };
 
 type MiniAppWindowQuery = {
@@ -102,7 +103,28 @@ type FridaServerHandle = {
     ) => MiniAppWindowHandle[];
 };
 
-type RecordedMiniAppWindow = MiniAppWindowHandle;
+type HookEventPayload = {
+    source: "wmpf-hook";
+    event: string;
+    hwnd?: unknown;
+    pid?: unknown;
+    tid?: unknown;
+    at?: unknown;
+    className?: unknown;
+    title?: unknown;
+    visible?: unknown;
+    visibleBefore?: unknown;
+    visibleAfter?: unknown;
+    scene?: unknown;
+    message?: unknown;
+    windows?: Array<{
+        hwnd?: unknown;
+        tid?: unknown;
+        className?: unknown;
+        title?: unknown;
+        visible?: unknown;
+    }>;
+};
 
 const FRIDA_RETRY_INTERVAL_MS = 2_000;
 const FRIDA_HEALTHCHECK_INTERVAL_MS = 3_000;
@@ -142,58 +164,11 @@ const parsePositiveInteger = (value: unknown) =>
 const parseOptionalString = (value: unknown) =>
     typeof value === "string" ? value : undefined;
 
-const isWindowCreatedPayload = (
-    payload: unknown,
-): payload is {
-    source: string;
-    event: string;
-    hwnd: unknown;
-    api?: unknown;
-    pid?: unknown;
-    threadId?: unknown;
-    className?: unknown;
-    windowName?: unknown;
-} =>
+const isHookEventPayload = (payload: unknown): payload is HookEventPayload =>
     typeof payload === "object" &&
     payload !== null &&
-    (payload as any).source === "win32-window-recorder" &&
-    (payload as any).event === "created";
-
-const isWindowObservedPayload = (
-    payload: unknown,
-): payload is {
-    source: string;
-    event: string;
-    hwnd: unknown;
-    api?: unknown;
-    pid?: unknown;
-    threadId?: unknown;
-} =>
-    typeof payload === "object" &&
-    payload !== null &&
-    (payload as any).source === "win32-window-recorder" &&
-    (payload as any).event === "observed";
-
-const isWindowLifecyclePayload = (
-    payload: unknown,
-): payload is {
-    source: string;
-    event: "show-requested" | "destroyed";
-    hwnd: unknown;
-    api?: unknown;
-    pid?: unknown;
-    threadId?: unknown;
-    command?: unknown;
-    visibleBefore?: unknown;
-    visibleAfter?: unknown;
-    success?: unknown;
-    style?: unknown;
-} =>
-    typeof payload === "object" &&
-    payload !== null &&
-    (payload as any).source === "win32-window-recorder" &&
-    ((payload as any).event === "show-requested" ||
-        (payload as any).event === "destroyed");
+    (payload as any).source === "wmpf-hook" &&
+    typeof (payload as any).event === "string";
 
 const resetAttachmentState = (runtime: FridaRuntimeState) => {
     runtime.pid = undefined;
@@ -335,17 +310,7 @@ const attachFrida = async (
     attachmentId: number,
     isCurrentAttachment: (id: number) => boolean,
     requestReconnect: () => void,
-    recordMiniAppWindow: (
-        handle: number,
-        observation: {
-            api?: unknown;
-            pid?: unknown;
-            threadId?: unknown;
-            className?: unknown;
-            windowName?: unknown;
-        },
-        evidence?: "created" | "shown",
-    ) => void,
+    handleHookEvent: (event: HookEventPayload) => void,
 ) => {
     const resolvedAt = Date.now();
     runtime.targetSelection = {
@@ -353,13 +318,6 @@ const attachFrida = async (
         selectedPid: target.pid,
         ...target.selection,
     };
-    emitMiniAppDiagnostic(logger, "frida_target_selected", {
-        resolvedAt: new Date(resolvedAt).toISOString(),
-        selectedPid: target.pid,
-        version: target.version,
-        ...target.selection,
-    });
-
     const session = await localDevice.attach(target.pid);
     try {
         const scriptContent = await loadHookScript(projectRoot);
@@ -378,11 +336,6 @@ const attachFrida = async (
                 runtime.hookInstalled = false;
                 runtime.lastError = formatFridaMessageError(message);
                 logger.error("[frida client]", message);
-                emitMiniAppDiagnostic(logger, "frida_script_error", {
-                    attachmentId,
-                    pid: target.pid,
-                    error: runtime.lastError,
-                });
                 requestReconnect();
                 return;
             }
@@ -393,50 +346,10 @@ const attachFrida = async (
                 if (message.payload === FRIDA_READY_MESSAGE) {
                     runtime.hookInstalled = true;
                 }
-            } else if (isWindowCreatedPayload(message.payload)) {
-                const handle = parseWindowHandle(message.payload.hwnd);
-                if (handle !== undefined) {
-                    runtime.lastHookEventAt = Date.now();
-                    runtime.lastHookMessage = `window created: 0x${handle.toString(16)}`;
-                    recordMiniAppWindow(handle, message.payload, "created");
-                }
-            } else if (isWindowObservedPayload(message.payload)) {
-                emitMiniAppDiagnostic(logger, "frida_window_observed", {
-                    attachmentId,
-                    hwnd: message.payload.hwnd,
-                    api: message.payload.api ?? null,
-                    pid: message.payload.pid ?? null,
-                    tid: message.payload.threadId ?? null,
-                    selectable: false,
-                    reason: "pre-existing EnumWindows observation",
-                });
-            } else if (isWindowLifecyclePayload(message.payload)) {
+            } else if (isHookEventPayload(message.payload)) {
                 runtime.lastHookEventAt = Date.now();
-                runtime.lastHookMessage =
-                    `window ${message.payload.event}: ${String(message.payload.hwnd)}`;
-                emitMiniAppDiagnostic(logger, "frida_window_lifecycle", {
-                    attachmentId,
-                    event: message.payload.event,
-                    hwnd: message.payload.hwnd,
-                    api: message.payload.api ?? null,
-                    pid: message.payload.pid ?? null,
-                    tid: message.payload.threadId ?? null,
-                    command: message.payload.command ?? null,
-                    visibleBefore:
-                        message.payload.visibleBefore ?? null,
-                    visibleAfter: message.payload.visibleAfter ?? null,
-                    success: message.payload.success ?? null,
-                    style: message.payload.style ?? null,
-                });
-                if (
-                    message.payload.event === "show-requested" &&
-                    message.payload.visibleAfter === true
-                ) {
-                    const handle = parseWindowHandle(message.payload.hwnd);
-                    if (handle !== undefined) {
-                        recordMiniAppWindow(handle, message.payload, "shown");
-                    }
-                }
+                runtime.lastHookMessage = `hook event: ${message.payload.event}`;
+                handleHookEvent(message.payload);
             }
             logger.frida_debug("[frida client]", message.payload);
         });
@@ -449,10 +362,6 @@ const attachFrida = async (
             runtime.phase = "error";
             runtime.lastError = "[frida] hook script destroyed";
             logger.info("[frida] hook script destroyed; scheduling rehook");
-            emitMiniAppDiagnostic(logger, "frida_script_destroyed", {
-                attachmentId,
-                pid: target.pid,
-            });
             requestReconnect();
         });
         session.detached.connect((reason, crash) => {
@@ -466,12 +375,6 @@ const attachFrida = async (
                 ? `[frida] session detached (${String(reason)}): ${crash.summary}`
                 : `[frida] session detached (${String(reason)})`;
             logger.info(runtime.lastError);
-            emitMiniAppDiagnostic(logger, "frida_detached", {
-                attachmentId,
-                pid: target.pid,
-                reason: String(reason),
-                crashSummary: crash?.summary ?? null,
-            });
             requestReconnect();
         });
         await script.load();
@@ -484,12 +387,6 @@ const attachFrida = async (
         logger.info(
             `[frida] script loaded, WMPF version: ${target.version}, pid: ${target.pid}`,
         );
-        emitMiniAppDiagnostic(logger, "frida_attached", {
-            attachmentId,
-            pid: target.pid,
-            version: target.version,
-            hookInstalled: runtime.hookInstalled,
-        });
         logger.info(`[frida] you can now open any miniapps`);
 
         return {
@@ -563,89 +460,158 @@ export const start_frida_server = (logger: Logger): FridaServerHandle => {
         phase: "waiting",
         hookInstalled: false,
     };
-    const recordedMiniAppWindows: RecordedMiniAppWindow[] = [];
+    const recordedMiniAppWindows = new Map<string, MiniAppWindowHandle>();
     let currentAttachment: FridaAttachment | undefined;
     let activeAttachmentId = 0;
     let miniAppWindowSequence = 0;
 
-    const recordMiniAppWindow = (
+    const upsertWindow = (
+        event: HookEventPayload,
+        evidence: MiniAppWindowHandle["evidence"],
         handle: number,
-        observation: {
-            api?: unknown;
-            pid?: unknown;
-            threadId?: unknown;
-            className?: unknown;
-            windowName?: unknown;
-        },
-        evidence: "created" | "shown" = "created",
+        at: number,
     ) => {
-        const existingWindow = recordedMiniAppWindows.find(
-            (candidate) => candidate.handle === handle,
-        );
-        let recordedWindow: RecordedMiniAppWindow;
-        if (existingWindow) {
-            existingWindow.sequence = ++miniAppWindowSequence;
-            existingWindow.createdAt = Date.now();
-            existingWindow.evidence = evidence;
-            existingWindow.pid = parsePositiveInteger(observation.pid);
-            existingWindow.threadId = parsePositiveInteger(
-                observation.threadId,
+        const pid = parsePositiveInteger(event.pid) ?? 0;
+        const tid = parsePositiveInteger(event.tid) ?? 0;
+        const className = parseOptionalString(event.className) ?? "";
+        const title = parseOptionalString(event.title) ?? "";
+        const visible =
+            event.visible === true || event.visibleAfter === true;
+        const key = `${pid}:${handle}`;
+        const existing = recordedMiniAppWindows.get(key);
+        if (existing && existing.destroyedAt === undefined) {
+            existing.sequence = Math.max(existing.sequence, miniAppWindowSequence + 1);
+            miniAppWindowSequence = Math.max(
+                miniAppWindowSequence,
+                existing.sequence,
             );
-            existingWindow.className = parseOptionalString(
-                observation.className,
-            );
-            existingWindow.windowName = parseOptionalString(
-                observation.windowName,
-            );
-            recordedWindow = existingWindow;
-        } else {
-            recordedWindow = {
-                handle,
-                sequence: ++miniAppWindowSequence,
-                createdAt: Date.now(),
-                evidence,
-                pid: parsePositiveInteger(observation.pid),
-                threadId: parsePositiveInteger(observation.threadId),
-                className: parseOptionalString(observation.className),
-                windowName: parseOptionalString(observation.windowName),
-            };
-            recordedMiniAppWindows.push(recordedWindow);
+            existing.createdAt = Math.min(existing.createdAt, at);
+            if (evidence === "created" || existing.evidence === "snapshot") {
+                existing.evidence = evidence;
+            }
+            existing.pid = pid || existing.pid;
+            existing.tid = tid || existing.tid;
+            existing.className = className || existing.className;
+            existing.title = title || existing.title;
+            existing.visible = visible || existing.visible;
+            return existing;
         }
 
-        while (recordedMiniAppWindows.length > 50) {
-            recordedMiniAppWindows.shift();
-        }
-        logger.info(
-            `[frida] recorded top-level hwnd candidate (${evidence}): 0x${handle.toString(16)}`,
-            {
-                api: observation.api ?? null,
-                pid: observation.pid ?? null,
-                threadId: observation.threadId ?? null,
-                className: observation.className ?? null,
-            },
-        );
-        emitMiniAppDiagnostic(logger, "frida_window_created", {
-            sequence: recordedWindow.sequence,
+        const entry: MiniAppWindowHandle = {
+            handle,
+            sequence: ++miniAppWindowSequence,
+            createdAt: at,
             evidence,
-            observedAt: new Date(recordedWindow.createdAt).toISOString(),
-            hwnd: `0x${handle.toString(16)}`,
-            pid: recordedWindow.pid ?? null,
-            tid: recordedWindow.threadId ?? null,
-            api: observation.api ?? null,
-            className: recordedWindow.className ?? null,
-            style: (observation as any).style ?? null,
-            exStyle: (observation as any).exStyle ?? null,
-            parentHwnd: (observation as any).parentHwnd ?? null,
-            reusedRecord: existingWindow !== undefined,
-        });
+            pid,
+            tid,
+            className,
+            title,
+            visible,
+        };
+        recordedMiniAppWindows.set(key, entry);
+        return entry;
+    };
+
+    const handleHookEvent = (event: HookEventPayload) => {
+        const at = typeof event.at === "number" ? event.at : Date.now();
+        const handle = parseWindowHandle(event.hwnd);
+        switch (event.event) {
+            case "window-created":
+                if (handle !== undefined) {
+                    const entry = upsertWindow(
+                        event,
+                        "created",
+                        handle,
+                        at,
+                    );
+                    logger.info(
+                        `[hook] window created 0x${handle.toString(16)} ` +
+                            `(pid=${entry.pid}, class=${entry.className}, title=${entry.title})`,
+                    );
+                }
+                break;
+            case "window-shown":
+                if (handle !== undefined) {
+                    const entry = upsertWindow(event, "shown", handle, at);
+                    logger.info(
+                        `[hook] window shown 0x${handle.toString(16)} ` +
+                            `(pid=${entry.pid}, visible=${entry.visible})`,
+                    );
+                }
+                break;
+            case "window-title-changed":
+                if (handle !== undefined) {
+                    const entry = upsertWindow(
+                        event,
+                        "created",
+                        handle,
+                        at,
+                    );
+                    logger.info(
+                        `[hook] window title 0x${handle.toString(16)} ` +
+                            `-> "${entry.title}"`,
+                    );
+                }
+                break;
+            case "window-destroyed":
+                if (handle !== undefined) {
+                    const pid = parsePositiveInteger(event.pid) ?? 0;
+                    const entry = recordedMiniAppWindows.get(
+                        `${pid}:${handle}`,
+                    );
+                    if (entry) {
+                        entry.destroyedAt = at;
+                        entry.visible = false;
+                        logger.info(
+                            `[hook] window destroyed 0x${handle.toString(16)} (pid=${pid})`,
+                        );
+                    }
+                }
+                break;
+            case "windows-snapshot":
+                for (const window of event.windows ?? []) {
+                    const snapshotHandle = parseWindowHandle(window.hwnd);
+                    if (snapshotHandle !== undefined) {
+                        upsertWindow(
+                            {
+                                ...event,
+                                hwnd: window.hwnd,
+                                tid: window.tid,
+                                className: window.className,
+                                title: window.title,
+                                visible: window.visible,
+                            },
+                            "snapshot",
+                            snapshotHandle,
+                            at,
+                        );
+                    }
+                }
+                logger.info(
+                    `[hook] window snapshot: ${(event.windows ?? []).length} host windows`,
+                );
+                break;
+            case "miniapp-load":
+                logger.info(
+                    `[hook] miniapp load scene=${event.scene ?? "?"}`,
+                );
+                break;
+            case "hook-error":
+                logger.error(`[hook] ${event.message ?? "unknown hook error"}`);
+                break;
+            case "recorder-installed":
+                logger.info("[hook] window recorder installed");
+                break;
+        }
     };
 
     const listMiniAppWindowCandidates = (
         query: MiniAppWindowQuery = {},
     ) =>
-        recordedMiniAppWindows
+        Array.from(recordedMiniAppWindows.values())
             .filter(
                 (candidate) =>
+                    candidate.destroyedAt === undefined &&
                     (query.afterSequence === undefined ||
                         candidate.sequence > query.afterSequence) &&
                     (query.createdAfter === undefined ||
@@ -654,6 +620,7 @@ export const start_frida_server = (logger: Logger): FridaServerHandle => {
                         candidate.createdAt <= query.createdBefore) &&
                     (query.pid === undefined || candidate.pid === query.pid),
             )
+            .sort((left, right) => left.sequence - right.sequence)
             .map((candidate) => ({ ...candidate }));
 
     void (async () => {
@@ -728,7 +695,7 @@ export const start_frida_server = (logger: Logger): FridaServerHandle => {
                         attachmentCounter,
                         isCurrentAttachment,
                         requestReconnect,
-                        recordMiniAppWindow,
+                        handleHookEvent,
                     );
                 }
 
@@ -743,9 +710,6 @@ export const start_frida_server = (logger: Logger): FridaServerHandle => {
                 resetAttachmentState(runtime);
                 runtime.lastError = formatError(error);
                 logger.error("[frida] watchdog error:", error);
-                emitMiniAppDiagnostic(logger, "frida_watchdog_error", {
-                    error,
-                });
                 await sleep(FRIDA_RETRY_INTERVAL_MS);
             }
         }

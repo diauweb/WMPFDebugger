@@ -2,51 +2,6 @@
 
 import { dlopen, JSCallback } from "bun:ffi";
 
-/**
- * Read-only diagnostics for relating an accepted miniapp debug socket to the
- * Windows process that owns the other end of that exact TCP connection.
- *
- * This module deliberately does not select, remember, activate, or close an
- * HWND. Its window list is evidence for a later identity decision only.
- */
-
-type SocketEndpoint = {
-    localAddress?: string;
-    localPort?: number;
-    remoteAddress?: string;
-    remotePort?: number;
-};
-
-type Win32WindowDiagnosticOptions = {
-    additionalWindowPids?: number[];
-};
-
-type TcpFamily = "ipv4" | "ipv6";
-
-type TcpRow = {
-    family: TcpFamily;
-    state: number;
-    localAddress: Uint8Array;
-    localScopeId: number;
-    localPort: number;
-    remoteAddress: Uint8Array;
-    remoteScopeId: number;
-    remotePort: number;
-    ownerPid: number;
-};
-
-type ReportedTcpRow = {
-    family: TcpFamily;
-    state: number;
-    localAddressHex: string;
-    localScopeId: number;
-    localPort: number;
-    remoteAddressHex: string;
-    remoteScopeId: number;
-    remotePort: number;
-    ownerPid: number;
-};
-
 type WindowRectangle = {
     left: number;
     top: number;
@@ -70,27 +25,6 @@ type Win32WindowSnapshot = {
     rect: WindowRectangle | null;
 };
 
-type Win32WindowDiagnostic = {
-    supported: boolean;
-    observedAt: string;
-    endpoint: SocketEndpoint;
-    serverPid: number;
-    transportPid: number | null;
-    transportProcessStartTime: string | null;
-    windowPids: number[];
-    windowProcessStartTimes: Record<string, string | null>;
-    tcp: {
-        serverMatchCount: number;
-        serverMatchesByFamily: Record<TcpFamily, number>;
-        reverseMatchCount: number;
-        reverseMatchesByFamily: Record<TcpFamily, number>;
-        serverRow: ReportedTcpRow | null;
-        reverseRow: ReportedTcpRow | null;
-    };
-    windows: Win32WindowSnapshot[];
-    errors: string[];
-};
-
 type Win32WindowInspection = {
     supported: boolean;
     windowCheckCompleted: boolean;
@@ -99,18 +33,6 @@ type Win32WindowInspection = {
     processStartTime: string | null;
     errors: string[];
 };
-
-const AF_INET = 2;
-const AF_INET6 = 23;
-const TCP_TABLE_OWNER_PID_ALL = 5;
-const NO_ERROR = 0;
-const ERROR_INSUFFICIENT_BUFFER = 122;
-const MIB_TCP_STATE_ESTAB = 5;
-
-const IPV4_ROW_SIZE = 24;
-const IPV6_ROW_SIZE = 56;
-const TABLE_HEADER_SIZE = 4;
-const MAX_TABLE_GROWTH_RETRIES = 4;
 
 const GW_OWNER = 4;
 const GA_ROOT = 2;
@@ -123,187 +45,6 @@ const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 
 const getErrorMessage = (error: unknown) =>
     error instanceof Error ? error.message : String(error);
-
-const normalizeEndpoint = (endpoint: SocketEndpoint): SocketEndpoint => ({
-    localAddress: endpoint?.localAddress,
-    localPort: endpoint?.localPort,
-    remoteAddress: endpoint?.remoteAddress,
-    remotePort: endpoint?.remotePort,
-});
-
-const isTcpPort = (value: unknown): value is number =>
-    Number.isSafeInteger(value) && Number(value) > 0 && Number(value) <= 65_535;
-
-const bytesEqual = (left: Uint8Array, right: Uint8Array) => {
-    if (left.byteLength !== right.byteLength) {
-        return false;
-    }
-    for (let index = 0; index < left.byteLength; index += 1) {
-        if (left[index] !== right[index]) {
-            return false;
-        }
-    }
-    return true;
-};
-
-const bytesToHex = (value: Uint8Array) =>
-    Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
-
-const reportTcpRow = (row: TcpRow | null): ReportedTcpRow | null =>
-    row
-        ? {
-              family: row.family,
-              state: row.state,
-              localAddressHex: bytesToHex(row.localAddress),
-              localScopeId: row.localScopeId,
-              localPort: row.localPort,
-              remoteAddressHex: bytesToHex(row.remoteAddress),
-              remoteScopeId: row.remoteScopeId,
-              remotePort: row.remotePort,
-              ownerPid: row.ownerPid,
-          }
-        : null;
-
-const countTcpFamilies = (rows: TcpRow[]): Record<TcpFamily, number> => ({
-    ipv4: rows.filter((row) => row.family === "ipv4").length,
-    ipv6: rows.filter((row) => row.family === "ipv6").length,
-});
-
-const parseTcpTable = (
-    table: Uint8Array,
-    returnedSize: number,
-    family: TcpFamily,
-): TcpRow[] => {
-    const rowSize = family === "ipv4" ? IPV4_ROW_SIZE : IPV6_ROW_SIZE;
-    if (returnedSize < TABLE_HEADER_SIZE || returnedSize > table.byteLength) {
-        throw new Error(
-            `${family} TCP table returned invalid size ${returnedSize} for ${table.byteLength}-byte buffer`,
-        );
-    }
-
-    const view = new DataView(
-        table.buffer,
-        table.byteOffset,
-        table.byteLength,
-    );
-    const count = view.getUint32(0, true);
-    const requiredSize = TABLE_HEADER_SIZE + count * rowSize;
-    if (requiredSize > returnedSize) {
-        throw new Error(
-            `${family} TCP table is truncated: ${count} rows need ${requiredSize} bytes, received ${returnedSize}`,
-        );
-    }
-
-    const rows: TcpRow[] = [];
-    for (let index = 0; index < count; index += 1) {
-        const offset = TABLE_HEADER_SIZE + index * rowSize;
-        if (family === "ipv4") {
-            rows.push({
-                family,
-                state: view.getUint32(offset, true),
-                localAddress: table.slice(offset + 4, offset + 8),
-                localScopeId: 0,
-                localPort: view.getUint16(offset + 8, false),
-                remoteAddress: table.slice(offset + 12, offset + 16),
-                remoteScopeId: 0,
-                remotePort: view.getUint16(offset + 16, false),
-                ownerPid: view.getUint32(offset + 20, true),
-            });
-            continue;
-        }
-
-        // MIB_TCP6ROW_OWNER_PID stores both scope IDs in network byte order.
-        rows.push({
-            family,
-            state: view.getUint32(offset + 48, true),
-            localAddress: table.slice(offset, offset + 16),
-            localScopeId: view.getUint32(offset + 16, false),
-            localPort: view.getUint16(offset + 20, false),
-            remoteAddress: table.slice(offset + 24, offset + 40),
-            remoteScopeId: view.getUint32(offset + 40, false),
-            remotePort: view.getUint16(offset + 44, false),
-            ownerPid: view.getUint32(offset + 52, true),
-        });
-    }
-    return rows;
-};
-
-const readTcpTable = (
-    getExtendedTcpTable: (...args: unknown[]) => number,
-    familyNumber: number,
-    family: TcpFamily,
-): TcpRow[] => {
-    const size = new Uint32Array(1);
-    const initialStatus = Number(
-        getExtendedTcpTable(
-            null,
-            size,
-            0,
-            familyNumber,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        ),
-    );
-    if (
-        initialStatus !== NO_ERROR &&
-        initialStatus !== ERROR_INSUFFICIENT_BUFFER
-    ) {
-        throw new Error(
-            `GetExtendedTcpTable(${family}) size query failed with ${initialStatus}`,
-        );
-    }
-    if (size[0] === 0) {
-        return [];
-    }
-
-    for (
-        let attempt = 0;
-        attempt < MAX_TABLE_GROWTH_RETRIES;
-        attempt += 1
-    ) {
-        const capacity = size[0];
-        const tableWords = new Uint32Array(Math.ceil(capacity / 4));
-        const table = new Uint8Array(
-            tableWords.buffer,
-            tableWords.byteOffset,
-            tableWords.byteLength,
-        );
-        size[0] = capacity;
-        const status = Number(
-            getExtendedTcpTable(
-                tableWords,
-                size,
-                0,
-                familyNumber,
-                TCP_TABLE_OWNER_PID_ALL,
-                0,
-            ),
-        );
-        if (status === ERROR_INSUFFICIENT_BUFFER) {
-            continue;
-        }
-        if (status !== NO_ERROR) {
-            throw new Error(
-                `GetExtendedTcpTable(${family}) failed with ${status}`,
-            );
-        }
-        return parseTcpTable(table, size[0], family);
-    }
-
-    throw new Error(
-        `GetExtendedTcpTable(${family}) kept growing during ${MAX_TABLE_GROWTH_RETRIES} reads`,
-    );
-};
-
-const isExactReverse = (server: TcpRow, candidate: TcpRow) =>
-    candidate.family === server.family &&
-    candidate.state === MIB_TCP_STATE_ESTAB &&
-    candidate.localPort === server.remotePort &&
-    candidate.remotePort === server.localPort &&
-    candidate.localScopeId === server.remoteScopeId &&
-    candidate.remoteScopeId === server.localScopeId &&
-    bytesEqual(candidate.localAddress, server.remoteAddress) &&
-    bytesEqual(candidate.remoteAddress, server.localAddress);
 
 const handleToBigInt = (value: unknown): bigint => {
     if (value === null || value === undefined) {
@@ -567,170 +308,6 @@ const readProcessStartTime = (pid: number) => {
  * top-level windows owned by that transport PID. Ambiguity returns no PID and
  * no HWND inventory; it never guesses.
  */
-const diagnoseWin32WindowIdentity = async (
-    socket: SocketEndpoint,
-    options: Win32WindowDiagnosticOptions = {},
-): Promise<Win32WindowDiagnostic> => {
-    const endpoint = normalizeEndpoint(socket);
-    const result: Win32WindowDiagnostic = {
-        supported: process.platform === "win32" && process.arch === "x64",
-        observedAt: new Date().toISOString(),
-        endpoint,
-        serverPid: process.pid,
-        transportPid: null,
-        transportProcessStartTime: null,
-        windowPids: [],
-        windowProcessStartTimes: {},
-        tcp: {
-            serverMatchCount: 0,
-            serverMatchesByFamily: { ipv4: 0, ipv6: 0 },
-            reverseMatchCount: 0,
-            reverseMatchesByFamily: { ipv4: 0, ipv6: 0 },
-            serverRow: null,
-            reverseRow: null,
-        },
-        windows: [],
-        errors: [],
-    };
-
-    if (process.platform !== "win32") {
-        result.errors.push("Win32 diagnostics are unavailable on this platform");
-        return result;
-    }
-    if (process.arch !== "x64") {
-        result.errors.push("Win32 diagnostics require x64 Windows");
-        return result;
-    }
-    if (!isTcpPort(endpoint.localPort) || !isTcpPort(endpoint.remotePort)) {
-        result.errors.push("socket localPort and remotePort must be valid TCP ports");
-        return result;
-    }
-
-    let rows: TcpRow[];
-    let iphlpapi: ReturnType<typeof dlopen> | null = null;
-    try {
-        iphlpapi = dlopen("iphlpapi.dll", {
-            GetExtendedTcpTable: {
-                args: ["ptr", "ptr", "i32", "u32", "u32", "u32"],
-                returns: "u32",
-            },
-        });
-        rows = [];
-        for (const [familyNumber, family] of [
-            [AF_INET, "ipv4"],
-            [AF_INET6, "ipv6"],
-        ] as const) {
-            try {
-                rows.push(
-                    ...readTcpTable(
-                        iphlpapi.symbols.GetExtendedTcpTable,
-                        familyNumber,
-                        family,
-                    ),
-                );
-            } catch (error) {
-                result.errors.push(
-                    `${family} TCP owner lookup failed: ${getErrorMessage(error)}`,
-                );
-            }
-        }
-    } catch (error) {
-        result.errors.push(`TCP owner lookup failed: ${getErrorMessage(error)}`);
-        return result;
-    } finally {
-        iphlpapi?.close?.();
-    }
-
-    const serverMatches = rows.filter(
-        (row) =>
-            row.state === MIB_TCP_STATE_ESTAB &&
-            row.ownerPid === process.pid &&
-            row.localPort === endpoint.localPort &&
-            row.remotePort === endpoint.remotePort,
-    );
-    result.tcp.serverMatchCount = serverMatches.length;
-    result.tcp.serverMatchesByFamily = countTcpFamilies(serverMatches);
-    if (serverMatches.length !== 1) {
-        result.errors.push(
-            `expected one server TCP row for the socket tuple, found ${serverMatches.length}`,
-        );
-        return result;
-    }
-
-    const serverRow = serverMatches[0];
-    result.tcp.serverRow = reportTcpRow(serverRow);
-    const reverseMatches = rows.filter(
-        (row) => row !== serverRow && isExactReverse(serverRow, row),
-    );
-    result.tcp.reverseMatchCount = reverseMatches.length;
-    result.tcp.reverseMatchesByFamily = countTcpFamilies(reverseMatches);
-    if (reverseMatches.length !== 1) {
-        result.errors.push(
-            `expected one exactly reversed client TCP row, found ${reverseMatches.length}`,
-        );
-        return result;
-    }
-
-    const reverseRow = reverseMatches[0];
-    result.tcp.reverseRow = reportTcpRow(reverseRow);
-    result.transportPid = reverseRow.ownerPid;
-    try {
-        result.transportProcessStartTime = readProcessStartTime(
-            result.transportPid,
-        );
-    } catch (error) {
-        result.errors.push(
-            `transport process start-time lookup failed: ${getErrorMessage(error)}`,
-        );
-    }
-
-    let user32: ReturnType<typeof dlopen> | null = null;
-    try {
-        const windowPids = new Set<number>([result.transportPid]);
-        for (const pid of options.additionalWindowPids ?? []) {
-            if (Number.isSafeInteger(pid) && pid > 0) {
-                windowPids.add(pid);
-            }
-        }
-        result.windowPids = Array.from(windowPids).sort(
-            (left, right) => left - right,
-        );
-        for (const pid of result.windowPids) {
-            if (
-                pid === result.transportPid &&
-                result.transportProcessStartTime !== null
-            ) {
-                result.windowProcessStartTimes[String(pid)] =
-                    result.transportProcessStartTime;
-                continue;
-            }
-            try {
-                result.windowProcessStartTimes[String(pid)] =
-                    readProcessStartTime(pid);
-            } catch (error) {
-                result.windowProcessStartTimes[String(pid)] = null;
-                result.errors.push(
-                    `window-owner process start-time lookup failed for ${pid}: ${getErrorMessage(error)}`,
-                );
-            }
-        }
-        user32 = openUser32();
-        const inventory = inventoryTopLevelWindows(
-            user32.symbols,
-            JSCallback,
-            windowPids,
-        );
-        result.windows = inventory.windows;
-        result.errors.push(...inventory.errors);
-    } catch (error) {
-        result.errors.push(`HWND inventory failed: ${getErrorMessage(error)}`);
-    } finally {
-        user32?.close?.();
-    }
-
-    return result;
-};
-
 const inspectWin32WindowIdentity = (
     handle: number | bigint,
     expectedPid: number,
@@ -802,12 +379,42 @@ const inspectWin32WindowIdentity = (
     return result;
 };
 
+/**
+ * Synchronous snapshot of the top-level windows owned by one PID. Used to
+ * capture a miniapp window at the moment its identity is known (bootstrap
+ * success) instead of depending on asynchronous window-creation events.
+ */
+const snapshotTopLevelWindowsForPid = (
+    pid: number,
+): Win32WindowSnapshot[] => {
+    if (
+        process.platform !== "win32" ||
+        process.arch !== "x64" ||
+        !Number.isSafeInteger(pid) ||
+        pid <= 0
+    ) {
+        return [];
+    }
+
+    let user32: ReturnType<typeof dlopen> | null = null;
+    try {
+        user32 = openUser32();
+        const inventory = inventoryTopLevelWindows(
+            user32.symbols,
+            JSCallback,
+            new Set([pid]),
+        );
+        return inventory.windows;
+    } catch {
+        return [];
+    } finally {
+        user32?.close?.();
+    }
+};
+
 export {
-    diagnoseWin32WindowIdentity,
     inspectWin32WindowIdentity,
-    SocketEndpoint,
-    Win32WindowDiagnosticOptions,
-    Win32WindowDiagnostic,
+    snapshotTopLevelWindowsForPid,
     Win32WindowInspection,
     Win32WindowSnapshot,
 };
