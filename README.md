@@ -95,6 +95,11 @@ The HTTP API can inspect SQLCipher-protected `.db` files from a configured
 folder. The API is read-only and keeps database handles in an internal idle
 cache; callers do not manage connections.
 
+When SQLCipher is configured (`WMPF_SQLCIPHER_DB_ROOT` or
+`--sqlcipher-db-root`), the server validates the library and key at startup
+and exits with an error if they are unusable, instead of failing every
+request later.
+
 ```bash
 export WMPF_SQLCIPHER_DB_ROOT=/path/to/databases
 export WMPF_SQLCIPHER_KEY="<64-hex-key>"

@@ -208,6 +208,18 @@ class SqlcipherService {
         private configuredRoot?: string,
     ) {}
 
+    // Fail fast: when the feature is configured (CLI flag or
+    // WMPF_SQLCIPHER_DB_ROOT), the library and key are validated at startup
+    // so a broken setup stops the server instead of failing every request.
+    initialize() {
+        const configured =
+            this.configuredRoot || process.env.WMPF_SQLCIPHER_DB_ROOT;
+        if (!configured) {
+            return;
+        }
+        this.ensureConfigured(true);
+    }
+
     listDatabases() {
         this.ensureConfigured(false);
         return collectDatabases(this.root!);
@@ -274,7 +286,9 @@ class SqlcipherService {
 
         const libraryPath = nativeLibraryPath();
         if (!existsSync(libraryPath) && libraryPath.includes(sep)) {
-            this.loadError = "SQLCipher library is unavailable";
+            this.loadError =
+                `SQLCipher library is unavailable: ${libraryPath} ` +
+                "(set WMPF_SQLCIPHER_LIBRARY or place native/sqlcipher.dll)";
             throw new SqlcipherError(503, this.loadError);
         }
 
@@ -373,7 +387,9 @@ class SqlcipherService {
                 read,
             };
         } catch (error) {
-            this.loadError = "failed to load SQLCipher library";
+            this.loadError =
+                `failed to load SQLCipher library from ${libraryPath}: ` +
+                (error instanceof Error ? error.message : String(error));
             this.logger.error("[sqlcipher] failed to load SQLCipher library:", error);
             throw new SqlcipherError(503, this.loadError);
         }
@@ -735,8 +751,11 @@ class SqlcipherService {
     }
 }
 
-const create_sqlcipher_service = (logger: Logger, root?: string) =>
-    new SqlcipherService(logger, root);
+const create_sqlcipher_service = (logger: Logger, root?: string) => {
+    const service = new SqlcipherService(logger, root);
+    service.initialize();
+    return service;
+};
 
 const get_sqlcipher_error_status = (error: unknown) =>
     error instanceof SqlcipherError ? error.statusCode : 500;
