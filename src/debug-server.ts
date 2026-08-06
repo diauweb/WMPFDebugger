@@ -1276,9 +1276,19 @@ export const debug_server = (
 
                     return;
                 }
+                const socketAlive =
+                    session.debugSocket?.readyState === WebSocket.OPEN;
+                if (!socketAlive) {
+                    // The miniapp disconnected while bootstrapping; the close
+                    // handler already tore the session down. This is normal
+                    // during rapid launch/reconnect cycles, not a failure.
+                    logger.info(
+                        `[miniapp] bootstrap interrupted for ${session.id}: ${errorMessage}`,
+                    );
+                    return;
+                }
                 if (
-                    bootstrapAttempt <= BOOTSTRAP_MAX_RETRIES &&
-                    session.debugSocket?.readyState === WebSocket.OPEN
+                    bootstrapAttempt <= BOOTSTRAP_MAX_RETRIES
                 ) {
                     logger.info(
                         `[miniapp] bootstrap attempt ${bootstrapAttempt} failed for ${session.id}; retrying`,

@@ -157,11 +157,6 @@ export const proxy_server = (
         }
     };
 
-    const findOtherPendingSpawn = (appid: string) =>
-        Array.from(pendingSpawns.values()).find(
-            (pendingSpawn) => pendingSpawn.appid !== appid,
-        );
-
     const rejectPendingSpawn = (appid: string, error: Error) => {
         const pendingSpawn = pendingSpawns.get(appid);
         if (!pendingSpawn) {
@@ -417,15 +412,6 @@ export const proxy_server = (
                 return;
             }
 
-            const otherPendingSpawn = findOtherPendingSpawn(appid);
-            if (otherPendingSpawn) {
-                sendJson(response, 409, {
-                    error: "another miniapp launch is still pending",
-                    pendingAppId: otherPendingSpawn.appid,
-                });
-                return;
-            }
-
             // A stale/failed session must never block a new launch. Retire it
             // (best-effort window close when a safe HWND is known) and proceed.
             if (existingSession) {
@@ -489,16 +475,6 @@ export const proxy_server = (
 
             const spawnForEvaluate = async () => {
                 if (!pendingSpawns.has(appid)) {
-                    const otherPendingSpawn = findOtherPendingSpawn(appid);
-                    if (otherPendingSpawn) {
-                        const conflict = new Error(
-                            "another miniapp launch is still pending",
-                        );
-                        (conflict as any).pendingAppId =
-                            otherPendingSpawn.appid;
-                        throw conflict;
-                    }
-
                     const pendingSpawn = registerPendingSpawn(appid);
                     try {
                         const status = await spawn_miniapp(appid);
@@ -555,14 +531,6 @@ export const proxy_server = (
                     try {
                         readySession = await spawnForEvaluate();
                     } catch (error) {
-                        const pendingAppId = (error as any)?.pendingAppId;
-                        if (pendingAppId) {
-                            sendJson(response, 409, {
-                                error: "another miniapp launch is still pending",
-                                pendingAppId,
-                            });
-                            return;
-                        }
                         if ((error as any)?.statusCode === 500) {
                             sendJson(response, 500, {
                                 error: "failed to spawn miniapp",
