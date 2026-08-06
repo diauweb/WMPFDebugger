@@ -490,7 +490,10 @@ export const debug_server = (
     // (no new window), a cached appid->window mapping is reused only after
     // field-by-field revalidation (hwnd, pid, tid, class, title).
     const captureWindowIdentity = (session: MiniAppSession) => {
-        if (session.windowIdentity) {
+        // Only claim a window once the socket has been identified as a
+        // specific appid; an unidentified connection must never be able to
+        // claim (or later close) a window that belongs to another miniapp.
+        if (session.windowIdentity || !session.requestedAppId) {
             return;
         }
         const hostPid = fridaServer.getStatus().pid;
