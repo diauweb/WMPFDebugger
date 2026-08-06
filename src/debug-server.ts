@@ -32,6 +32,7 @@ const BOOTSTRAP_RETRY_INTERVAL_MS = 1_500;
 const BOOTSTRAP_MAX_RETRIES = 3;
 const CLOSE_CDP_GRACE_MS = 2_000;
 const WINDOW_CENSUS_LAUNCH_GRACE_MS = 3_000;
+const EVALUATE_TIMEOUT_MS = 30_000;
 
 const ACCOUNT_INFO_EXPRESSION = `
 (() => {
@@ -84,7 +85,6 @@ export const isDeadSessionFailure = (error: unknown) => {
     return (
         message.includes("miniapp debug socket unavailable") ||
         message.includes("miniapp disconnected") ||
-        message.includes("CDP timeout") ||
         message.includes("app context became unavailable") ||
         message.includes("app target binding unavailable") ||
         message.includes("unable to find app target") ||
@@ -594,6 +594,7 @@ export const debug_server = (
         method: string,
         params?: Record<string, unknown>,
         sessionId?: string,
+        timeoutMs: number = INTERNAL_CDP_TIMEOUT_MS,
     ) => {
         const id = ++session.internalCommandCounter;
         const payload: Record<string, unknown> = {
@@ -612,7 +613,7 @@ export const debug_server = (
             const timeout = setTimeout(() => {
                 session.pendingCommands.delete(id);
                 reject(new Error(`CDP timeout for ${method}`));
-            }, INTERNAL_CDP_TIMEOUT_MS);
+            }, timeoutMs);
             session.pendingCommands.set(id, { resolve, reject, timeout });
             try {
                 sendMiniAppCdpMessage(session, message);
@@ -923,6 +924,7 @@ export const debug_server = (
                     returnByValue: true,
                 },
                 appContext.sessionId,
+                EVALUATE_TIMEOUT_MS,
             );
             touchSession(session);
             return {

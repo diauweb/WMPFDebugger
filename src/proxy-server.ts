@@ -544,7 +544,11 @@ export const proxy_server = (
                             error,
                         );
                         sendJson(response, 504, {
-                            error: "miniapp did not become ready in time",
+                            error:
+                                "miniapp did not become ready in time; " +
+                                "if a window opened but no debug socket " +
+                                "connected, open the miniapp from the WeChat " +
+                                "UI instead of the launch bridge",
                             miniappId: failedSession?.id ?? appid,
                             miniappClosed: false,
                             forcedClose: false,
@@ -644,7 +648,7 @@ export const proxy_server = (
                     attemptedAttachments: evaluation.failures,
                     miniappClosed: evaluation.deadCount > 0,
                     forcedClose: false,
-                    sessionRetained: false,
+                    sessionRetained: evaluation.deadCount === 0,
                 });
                 return;
             }
